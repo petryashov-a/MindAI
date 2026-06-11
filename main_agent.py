@@ -70,6 +70,7 @@ def _parse_args():
     data   = 'data'
     remote = None
     gui    = False
+    c4     = False
     i = 0
     while i < len(args):
         a = args[i]
@@ -77,16 +78,33 @@ def _parse_args():
         elif a == '--remote'   and i+1 < len(args): remote = args[i+1]; i += 2
         elif a == '--download' and i+1 < len(args): _download_weights(args[i+1]); sys.exit(0)
         elif a == '--gui':                          gui    = True;       i += 1
+        elif a == '--c4':                           c4     = True;       i += 1
         elif a in ('-h', '--help'): print(__doc__); sys.exit(0)
         else: i += 1
-    return Path(data), remote, gui
+    return Path(data), remote, gui, c4
 
 
-def _build_world(sources: dict):
+def _c4_stream(min_len: int = 200):
+    """In-memory stream of C4 English paragraphs (no disk writes)."""
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        print('>>> --c4 требует: pip install datasets')
+        return
+    ds = load_dataset('allenai/c4', 'en', split='train', streaming=True)
+    for row in ds:
+        t = (row.get('text') or '').strip()
+        if len(t) >= min_len:
+            yield t
+
+
+def _build_world(sources: dict, c4: bool = False):
     print('\n>>> Источники данных:')
     for k, v in sources.items():
         print(f'    {k:<8} → {v}')
-    if not sources:
+    if c4:
+        print(f'    {"c4":<8} → allenai/c4 (en, streaming, in-memory)')
+    if not sources and not c4:
         print('    (нет данных — только интерактивный режим)')
     print()
 
@@ -100,6 +118,7 @@ def _build_world(sources: dict):
         audio_size   = _AUDIO_SIZE,
         interactive  = True,
         curriculum   = _CURRICULUM,
+        text_stream  = _c4_stream() if c4 else None,
     )
 
 
@@ -134,7 +153,7 @@ def _build_brain(world):
 # ---------------------------------------------------------------------------
 
 def run():
-    data_dir, remote, gui = _parse_args()
+    data_dir, remote, gui, c4 = _parse_args()
     sources = _discover_data(data_dir)
 
     if gui:
@@ -146,10 +165,10 @@ def run():
         return
 
     if remote:
-        _run_remote(sources, remote)
+        _run_remote(sources, remote, c4)
         return
 
-    world = _build_world(sources)
+    world = _build_world(sources, c4=c4)
     brain = _build_brain(world)
 
     if Path(_SAVE_DIR + '/brain.json').exists():
@@ -177,7 +196,7 @@ def run():
 # Remote WebSocket run — brain on friend's GPU, world local
 # ---------------------------------------------------------------------------
 
-def _run_remote(sources: dict, server_url: str):
+def _run_remote(sources: dict, server_url: str, c4: bool = False):
     """Run with brain on a remote GPU server.
 
     Architecture: this process owns the AgentWorld (mic, files, stdin); the
@@ -207,7 +226,7 @@ def _run_remote(sources: dict, server_url: str):
     print('>>> Сервер исполняет ВЕСЬ brain.run() (PFC, BG, sleep, нейромодуляторы)')
     print('>>> Локально остаётся мир: ретина / cochlea / stdin / файлы\n')
 
-    world = _build_world(sources)
+    world = _build_world(sources, c4=c4)
 
     ws = None
     for attempt in range(10):

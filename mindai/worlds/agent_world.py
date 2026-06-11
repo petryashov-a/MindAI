@@ -240,6 +240,8 @@ class _PairedSource:
 
         if not self._pairs:
             raise FileNotFoundError('No images or videos found')
+        # Sort by extension class so callers know what they're getting,
+        # but shuffle within each class so order is randomised.
         random.shuffle(self._pairs)
         with_caption = sum(1 for _, c in self._pairs if c)
         print(f'>>> AgentWorld visual: {len(self._pairs)} files '
@@ -280,6 +282,18 @@ class _PairedSource:
             except ImportError:
                 pass
             self._hold_ticks = _PAIRED_HOLD_TICKS
+
+    @property
+    def is_active(self) -> bool:
+        """True while a paired item is currently being shown.
+
+        Used by AgentWorld to lock curriculum mode and silence the token
+        channel — so corpus.txt cannot leak into the brain's token-input
+        while it is watching a captionless video or holding an image.
+        """
+        if self._video_stream is not None:
+            return not self._video_stream.is_done
+        return self._hold_ticks > 0
 
     def tick(self, tokens_remaining: int = 0) -> tuple[np.ndarray | None, str | None]:
         """Call each tick. Returns (frame, caption_or_None).
@@ -409,6 +423,8 @@ class AgentWorld:
         max_context:   int                     = 64,
         curriculum:    tuple[float,float,float]= (0.70, 0.25, 0.05),
         tokenizer:     str                     = 'auto',
+        text_stream                            = None,
+        phase_ticks:   dict[str, int] | None   = None,
     ):
         self._token_n     = TOKEN_NEURONS
         self._v_size      = vision_size
@@ -445,6 +461,7 @@ class AgentWorld:
             self._raw_lines = list(_SEED_CORPUS)
             print('>>> AgentWorld raw: seed corpus')
         self._raw_idx = 0
+        self._text_stream = iter(text_stream) if text_stream is not None else None
 
         # ---- Q&A corpus --------------------------------------------------
         self._qa_pairs: list[tuple[str, str]] = []
@@ -467,20 +484,66 @@ class AgentWorld:
         elif audio_source:
             self._audio_file = _AudioFileSource(audio_source, audio_size=audio_size)
 
-        # ---- paired (ostensive) — images + videos, captions optional --------
-        self._paired: _PairedSource | None = None
+        # If video data is present we need a shared cochlea for video-frame
+        # audio to land somewhere — _VideoFrameAudioSource pushes into it.
+        # Mic is NOT started here; the cochlea is purely a receiver.
+        _video_dir_present = video_dir and Path(video_dir).is_dir()
+        if _video_dir_present and self._cochlea is None:
+            self._cochlea = _import_cochlea(audio_size)
+
+        # ---- paired (ostensive) — images and videos as SEPARATE sources -----
+        # Kept apart so the curriculum can introduce them in phases:
+        # text → images (+text) → video (+images+text).
+        # Mixing video and text simultaneously without a caption was teaching
+        # STDP to bind unrelated corpus tokens onto POV-video frames.
+        self._paired_images: _PairedSource | None = None
+        self._paired_videos: _PairedSource | None = None
         has_images = images_dir and Path(images_dir).is_dir()
         has_video  = video_dir  and Path(video_dir).is_dir()
-        if has_images or has_video:
-            self._paired = _PairedSource(
-                images_dir=images_dir if has_images else None,
-                video_dir =video_dir  if has_video  else None,
-                cochlea   =self._cochlea,   # now correctly set
-            )
+        if has_images:
+            try:
+                self._paired_images = _PairedSource(
+                    images_dir=images_dir, video_dir=None,
+                    cochlea=self._cochlea)
+            except FileNotFoundError:
+                self._paired_images = None
+        if has_video:
+            try:
+                self._paired_videos = _PairedSource(
+                    images_dir=None, video_dir=video_dir,
+                    cochlea=self._cochlea)
+            except FileNotFoundError:
+                self._paired_videos = None
+
+        # ---- curriculum phase machine ------------------------------------
+        # Strict sequential phases — ONE source active at a time, no mixing.
+        # Order: c4 → text → images → video → audio → qa.
+        # Each phase silences inputs that don't belong to it (token channel,
+        # audio channel) so STDP never builds anti-bindings between modalities
+        # that just happen to co-occur in wall-clock time.
+        # Phases without data are skipped automatically.
+        # Defaults assume 10 Hz; tweak via phase_ticks={'name': start_tick}.
+        default_pt = {
+            'c4':     0,
+            'text':   30_000,
+            'images': 60_000,
+            'video':  120_000,
+            'audio':  200_000,
+            'qa':     250_000,
+        }
+        self._phase_starts = dict(default_pt)
+        if phase_ticks:
+            self._phase_starts.update(phase_ticks)
+        # Canonical ordering — used for both promotion and skipping
+        self._phase_order = ('c4', 'text', 'images', 'video', 'audio', 'qa')
+        # Initial phase: first available
+        self._phase: str = self._first_available_phase()
+        self._phase_announced: set[str] = set()
 
         # ---- vision (retina) ---------------------------------------------
         self._retina = None
-        has_vision   = self._paired is not None
+        has_vision   = (self._paired_images is not None
+                        or self._paired_videos is not None)
         if has_vision:
             if vision_size % 5 != 0:
                 raise ValueError('vision_size must be divisible by 5')
@@ -576,7 +639,9 @@ class AgentWorld:
             if self._injected_frame is not None:
                 return self._injected_frame
 
-        if self._mode == 'paired' and self._paired_frame is not None:
+        # Vision is only emitted during paired phases (images/video).
+        if (self._phase in ('images', 'video')
+                and self._paired_frame is not None):
             return self._paired_frame
         return np.zeros((480, 640, 3), dtype=np.uint8)
 
@@ -587,26 +652,133 @@ class AgentWorld:
     def get_homeostatic_signals(self) -> dict[str, float]:
         return {'pain': 0.0, 'hunger': 0.0, 'thirst': 0.0}
 
-    def get_sensory_retina(self, num_neurons: int) -> np.ndarray:
-        # Pick curriculum mode for this tick (only when no interactive prompt)
-        if not self._input_queue:
-            roll = random.random()
-            if roll < self._thresh_raw:
-                self._mode = 'raw'
-            elif roll < self._thresh_paired and self._paired:
-                self._mode = 'paired'
-                frame, caption = self._paired.tick(tokens_remaining=len(self._input_queue))
-                self._paired_frame = frame
-                if caption:
-                    ids = self._tokenizer.encode(caption)
-                    self._input_queue.extend(ids)
+    # -----------------------------------------------------------------------
+    # Curriculum phase machine
+    # -----------------------------------------------------------------------
+
+    def _phase_has_data(self, phase: str) -> bool:
+        """True if the data source for `phase` is actually configured."""
+        if phase == 'c4':     return self._text_stream is not None
+        if phase == 'text':   return bool(self._raw_lines)
+        if phase == 'images': return self._paired_images is not None
+        if phase == 'video':  return self._paired_videos is not None
+        if phase == 'audio':  return (self._cochlea is not None
+                                      or self._audio_file is not None)
+        if phase == 'qa':     return bool(self._qa_pairs)
+        return False
+
+    def _first_available_phase(self) -> str:
+        for p in self._phase_order:
+            if self._phase_has_data(p):
+                return p
+        return 'text'   # safe fallback
+
+    def _maybe_advance_phase(self) -> None:
+        """Promote phase by tick count along the canonical order.
+
+        Phases with no configured data source are skipped.
+        Each phase crossing is announced once in the log.
+        """
+        t = self._tick_counter[0]
+        cur_idx = self._phase_order.index(self._phase)
+        # Walk forward from current phase, advancing as long as the next
+        # phase's start tick has been reached.
+        for nxt in self._phase_order[cur_idx + 1:]:
+            if t < self._phase_starts.get(nxt, 1 << 60):
+                break
+            if self._phase_has_data(nxt):
+                self._phase = nxt
+        if self._phase not in self._phase_announced:
+            print(f'\n>>> [CURRICULUM] фаза → {self._phase} '
+                  f'на тике {t:,}\n')
+            self._phase_announced.add(self._phase)
+
+    def _pick_phase_source(self) -> None:
+        """Strict phase selection — exactly one active source per phase.
+
+        c4     — streaming text dataset (allenai/c4 etc.) via _text_stream
+        text   — corpus.txt only
+        images — paired_images only (captions feed token channel)
+        video  — paired_videos only (their own audio feeds audio channel)
+        audio  — audio stream only (no vision, no tokens)
+        qa     — qa.txt only
+
+        _load_next_token consults self._phase to decide which text source
+        to pull from (c4 stream vs corpus paragraphs). Other channels are
+        gated in get_sensory_retina.
+        """
+        if self._phase in ('c4', 'text'):
+            self._mode = self._phase           # 'c4' or 'text'
+            return
+
+        if self._phase == 'images':
+            if self._paired_images is not None:
+                self._activate_paired(self._paired_images, 'paired_image')
             else:
+                self._mode = 'silent'
+            return
+
+        if self._phase == 'video':
+            if self._paired_videos is not None:
+                self._activate_paired(self._paired_videos, 'paired_video')
+            else:
+                self._mode = 'silent'
+            return
+
+        if self._phase == 'audio':
+            # No vision, no tokens — just listen.
+            self._mode = 'audio'
+            return
+
+        if self._phase == 'qa':
+            if self._qa_pairs:
+                q, a = self._qa_pairs[self._qa_idx % len(self._qa_pairs)]
+                self._qa_idx += 1
+                self._input_queue.extend(self._tokenizer.encode(q + ' ' + a))
                 self._mode = 'qa'
-                if self._qa_pairs:
-                    q, a = self._qa_pairs[self._qa_idx % len(self._qa_pairs)]
-                    self._qa_idx += 1
-                    ids = self._tokenizer.encode(q + ' ' + a)
-                    self._input_queue.extend(ids)
+            else:
+                self._mode = 'silent'
+            return
+
+        self._mode = 'silent'
+
+    def _activate_paired(self, source: '_PairedSource', mode: str) -> None:
+        frame, caption = source.tick(tokens_remaining=0)
+        self._paired_frame = frame
+        if caption:
+            self._input_queue.extend(self._tokenizer.encode(caption))
+        self._mode = mode
+
+    def get_sensory_retina(self, num_neurons: int) -> np.ndarray:
+        # Advance curriculum phase if its tick threshold has been crossed
+        self._maybe_advance_phase()
+
+        # If a paired item is already on screen, keep it on screen and just
+        # advance its frame — do NOT redraw curriculum, do NOT pull corpus
+        # tokens. This is the fix for the "corpus.txt leaking into video"
+        # anti-binding bug.
+        media_active = False
+        if self._paired_images is not None and self._paired_images.is_active:
+            frame, caption = self._paired_images.tick(
+                tokens_remaining=len(self._input_queue))
+            self._paired_frame = frame
+            if caption:
+                self._input_queue.extend(self._tokenizer.encode(caption))
+            self._mode = 'paired_image'
+            media_active = True
+        elif self._paired_videos is not None and self._paired_videos.is_active:
+            frame, caption = self._paired_videos.tick(
+                tokens_remaining=len(self._input_queue))
+            self._paired_frame = frame
+            if caption:
+                self._input_queue.extend(self._tokenizer.encode(caption))
+            self._mode = 'paired_video'
+            media_active = True
+
+        # Otherwise pick a fresh source for this tick — but only if the
+        # token queue is empty (don't interrupt a sentence mid-stream).
+        if not media_active and not self._input_queue:
+            self._pick_phase_source()
 
         parts: list[np.ndarray] = []
 
@@ -618,13 +790,25 @@ class AgentWorld:
             except Exception:
                 parts.append(np.zeros(self._v_size, dtype=np.float32))
 
-        # Audio
-        if self._cochlea is not None:
-            spec = self._cochlea.get_auditory_nerve_signal()
-            parts.append(np.concatenate([spec, self._prev_audio]).astype(np.float32))
-            self._prev_audio = spec.copy()
-        elif self._audio_file is not None:
-            spec = self._audio_file.get()
+        # Audio — strict phase gating. The audio channel is only fed in
+        # the 'video' and 'audio' phases. During earlier phases (c4, text,
+        # images) any background source (mic, _AudioFileSource thread) is
+        # ignored so STDP cannot bind unrelated audio onto whatever else
+        # is active. The channel still exists in the sensory layout so we
+        # emit zeros to keep shapes consistent.
+        if self._cochlea is not None or self._audio_file is not None:
+            zero_spec = np.zeros(self._a_size, dtype=np.float32)
+            if self._phase == 'video' and self._cochlea is not None:
+                spec = self._cochlea.get_auditory_nerve_signal()
+            elif self._phase == 'audio':
+                if self._audio_file is not None:
+                    spec = self._audio_file.get()
+                elif self._cochlea is not None:
+                    spec = self._cochlea.get_auditory_nerve_signal()
+                else:
+                    spec = zero_spec
+            else:
+                spec = zero_spec
             parts.append(np.concatenate([spec, self._prev_audio]).astype(np.float32))
             self._prev_audio = spec.copy()
 
@@ -830,13 +1014,26 @@ class AgentWorld:
             self._current_token = self._next_token
             self._next_token    = self._input_queue.pop(0)
             return
-        # Chat mode: while a media injection is being examined OR a response is
-        # still pending, do NOT pollute the token channel with corpus text.
-        # Feed a silence token so the brain stays focused on the injected media.
-        if self._streaming or self._pending_response_at > 0:
+        # Silence token channel whenever paired media is on screen with no
+        # queued caption tokens, or during interactive injection / pending
+        # response. This blocks the curriculum-mix anti-binding bug:
+        # corpus.txt tokens must NEVER fire during a captionless video.
+        paired_active = (
+            (self._paired_images is not None and self._paired_images.is_active)
+            or (self._paired_videos is not None and self._paired_videos.is_active)
+        )
+        if self._streaming or self._pending_response_at > 0 or paired_active:
             self._current_token = self._next_token
             self._next_token    = 0
             return
+        # Outside the two text-streaming phases the token channel is silent.
+        # paired phases handle their own caption tokens through _input_queue;
+        # qa phase queues from qa_pairs; audio/silent phases emit nothing.
+        if self._phase not in ('c4', 'text'):
+            self._current_token = self._next_token
+            self._next_token    = 0
+            return
+
         # Continue reading current paragraph if tokens remain
         if (hasattr(self, '_corpus_tokens')
                 and self._corpus_token_idx < len(self._corpus_tokens)):
@@ -844,13 +1041,28 @@ class AgentWorld:
             self._next_token       = self._corpus_tokens[self._corpus_token_idx]
             self._corpus_token_idx += 1
             return
-        # Load next paragraph from raw corpus
+        # Load next paragraph from the source dictated by current phase
         while True:
-            if self._raw_idx >= len(self._raw_lines):
-                self._raw_idx = 0
-                random.shuffle(self._raw_lines)
-            line = self._raw_lines[self._raw_idx]
-            self._raw_idx += 1
+            line = None
+            if self._phase == 'c4' and self._text_stream is not None:
+                try:
+                    line = next(self._text_stream)
+                except StopIteration:
+                    self._text_stream = None
+                except Exception as e:
+                    print(f'>>> text_stream error: {e}; phase c4 exhausted')
+                    self._text_stream = None
+            elif self._phase == 'text' and self._raw_lines:
+                if self._raw_idx >= len(self._raw_lines):
+                    self._raw_idx = 0
+                    random.shuffle(self._raw_lines)
+                line = self._raw_lines[self._raw_idx]
+                self._raw_idx += 1
+            if line is None:
+                # No data this tick — emit silence
+                self._current_token = self._next_token
+                self._next_token    = 0
+                return
             ids = self._tokenizer.encode(line)
             if ids:
                 self._corpus_tokens    = ids
