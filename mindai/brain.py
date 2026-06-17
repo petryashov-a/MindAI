@@ -93,6 +93,10 @@ from mindai.architecture.olfactory_bulb import OlfactoryBulb
 from mindai.lifecycle.sleep_consolidation import SleepCycle, SleepPhase
 from mindai.lifecycle.circadian_rhythm import BiologicalClock
 from mindai.architecture.superior_colliculus import SuperiorColliculus
+from mindai.architecture.language_cortex import LanguageCortex, _COMM_DRIVE_THRESHOLD
+from mindai.architecture.prefrontal_cortex import DialogueWorkingMemory
+from mindai.engine.sdr_encoder import SDREncoder
+from mindai.engine.cross_modal_binder import CrossModalBinder
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +113,8 @@ class _NullChemistry:
     """
     dopamine               = 0.5
     noradrenaline          = 0.5
+    serotonin              = 0.5
+    dopamine_mesocortical  = 0.5
     cortisol               = 0.0
     oxytocin               = 0.0
     adrenaline             = 0.0
@@ -131,6 +137,7 @@ class _NullChemistry:
     def update_state(self, **kw): pass
     def trigger_social_bonding(self): pass
     def trigger_endorphin_rush(self): pass
+    def derive_mood(self): return 'neutral'
 
 
 _NULL_CHEM = _NullChemistry()
@@ -172,6 +179,7 @@ class Brain:
         save_path:           str   = 'savegame',
         num_actions:         int   = 5,
         synapse_density:     float = 0.01,
+        rehab_ticks:         int   = 0,
     ) -> None:
         if device == 'auto':
             if torch.cuda.is_available():
@@ -181,7 +189,7 @@ class Brain:
                 if needed_gb <= free_gb:
                     self._device = torch.device('cuda')
                 else:
-                    print(f'>>> VRAM {free_gb:.1f} GB < нужно {needed_gb:.1f} GB → CPU')
+                    print(f'>>> VRAM {free_gb:.1f} GB < нужно {needed_gb:.1f} GB -> CPU')
                     self._device = torch.device('cpu')
             else:
                 self._device = torch.device('cpu')
@@ -189,6 +197,9 @@ class Brain:
             self._device = torch.device(device)
 
         self.save_path = save_path
+        self._rehab_ticks_left = rehab_ticks
+        if rehab_ticks > 0:
+            print(f'>>> [РЕАБИЛИТАЦИЯ] Активирован режим реабилитации на {rehab_ticks} тиков.')
 
         self._layout = SensoryLayout.from_channels(
             vision_size=int(sensory_layout.get('vision', 0)),
@@ -202,9 +213,15 @@ class Brain:
         print(f'>>> Инициализация разума: {num_neurons} нейронов на {self._device}')
 
         # Core neural substrate — always present
-        self._plasticity    = StructuralPlasticity(num_neurons, initial_density=synapse_density)
-        self._time          = HusserlianTime(num_neurons, window_size=3)
-        self._predictor     = PredictiveMicrocircuits(num_neurons)
+        self._geometry      = BrainGeometry(num_neurons)
+        self._plasticity    = StructuralPlasticity(
+            num_neurons,
+            initial_density=synapse_density,
+            device=self._device,
+            coordinates=self._geometry.coordinates
+        )
+        self._time          = HusserlianTime(num_neurons, window_size=3, device=self._device)
+        self._predictor     = PredictiveMicrocircuits(num_neurons, device=self._device)
         self._workspace     = PhaseCoupledWorkspace(num_neurons, self._device)
         self._thalamus      = Thalamus(num_neurons, self._device)
         self._ego           = EgoModel(expected_baseline=1.0)
@@ -226,10 +243,9 @@ class Brain:
         self._entorhinal    = EntorhinalGrid()
         self._olfactory     = OlfactoryBulb()
         self._free_will     = FreeWillEngine(delay_ticks=3)
-        self._pfc           = PrefrontalCortex(num_neurons)
+        self._pfc           = PrefrontalCortex(num_neurons, self._layout.end('motor'))
         self._semantics     = SemanticMemory()
         self._nc            = NeuralComplexity(num_neurons)
-        self._geometry      = BrainGeometry(num_neurons)
         # Amygdala — fear conditioning (LeDoux 1996); receives sensory slice
         _sensory_size = sum(sensory_layout.values())
         self._amygdala = Amygdala(num_sensory=min(_sensory_size, num_neurons))
@@ -265,6 +281,39 @@ class Brain:
 
         # Theory of Mind — other-agent mental state inference (Saxe 2003)
         self._tom = TheoryOfMind()
+
+        # LanguageCortex — Wernicke (comprehension) + Broca (production + syntax)
+        # token_dim: SDR output size = 2% of num_neurons, min 64
+        _lang_token_dim = max(64, int(num_neurons * 0.02))
+        _lang_grid_dim  = self._entorhinal.total_cells
+        self._language_cortex = LanguageCortex(
+            token_dim    = _lang_token_dim,
+            grid_dim     = _lang_grid_dim,
+            semantic_dim = 128,
+            vocab_size   = 256,
+        )
+
+        # SDR Encoder — sparse distributed representation for text column
+        self._sdr_encoder = SDREncoder(n=_lang_token_dim)
+
+        # Cross-modal binder — Damasio convergence zones (Damasio 1989)
+        _audio_dim  = int(sensory_layout.get('audio',  64))
+        _vision_dim = int(sensory_layout.get('vision', 64))
+        self._lang_audio_dim  = _audio_dim
+        self._lang_vision_dim = _vision_dim
+        self._cross_modal_binder = CrossModalBinder(modality_dims={
+            'text':        _lang_token_dim,
+            'audio':       _audio_dim,
+            'vision':      _vision_dim,
+            'interoception': 4,   # [pain, hunger, thirst, arousal]
+        })
+
+        # Attach DialogueBeliefState to ToM (linguistic Theory of Mind)
+        self._tom.attach_dialogue_belief(semantic_dim=128)
+
+        # dlPFC Dialogue Working Memory — attached to PrefrontalCortex (BA46/9)
+        # Goldman-Rakic (1995): persistent firing maintains dialogue context online.
+        self._pfc.attach_dialogue_wm(semantic_dim=128)
 
         # Cortical layers — canonical microcircuit (Douglas & Martin 1991)
         self._layers = CorticalLayers(num_neurons, self._device)
@@ -383,17 +432,17 @@ class Brain:
             return self._load_pkl(p)
         return self._load_dir(p)
 
-    def save(self, path: str | None = None) -> None:
+    def save(self, path: str | None = None, world = None) -> None:
         """Save brain weights (brain state only — world state not included)."""
         p = path or self.save_path
         if self._is_legacy_path(p):
             self._save_pkl(p)
         else:
-            self._save_dir(p)
+            self._save_dir(p, world)
 
     # --- new directory format -------------------------------------------------
 
-    def _save_dir(self, save_dir: str) -> None:
+    def _save_dir(self, save_dir: str, world = None) -> None:
         d = Path(save_dir)
         d.mkdir(parents=True, exist_ok=True)
         try:
@@ -403,6 +452,8 @@ class Brain:
             # Astrocytic slow EMA — long-term memory stabiliser
             slow_w = (self._astrocytes._slow_weights.cpu().numpy()
                       if self._astrocytes._slow_weights is not None else None)
+            avg_act = (self._astrocytes._avg_activity.cpu().numpy()
+                       if self._astrocytes._avg_activity is not None else None)
             payload = {
                 'row': idx[0], 'col': idx[1],
                 'weights': w, 'integrity': ig,
@@ -410,6 +461,52 @@ class Brain:
             }
             if slow_w is not None:
                 payload['astro_slow'] = slow_w
+            if avg_act is not None:
+                payload['astro_avg_act'] = avg_act
+
+            # Predictive hierarchy weights
+            payload['pred_td_indices'] = self._predictor.td_indices.cpu().numpy()
+            payload['pred_td_values'] = self._predictor.td_values.cpu().numpy()
+            payload['pred_bu_indices'] = self._predictor.bu_indices.cpu().numpy()
+            payload['pred_bu_values'] = self._predictor.bu_values.cpu().numpy()
+            payload['pred_td_perm'] = self._predictor.td_perm.cpu().numpy()
+            payload['pred_bu_perm'] = self._predictor.bu_perm.cpu().numpy()
+
+            # Language cortex weights
+            payload['lang_wernicke_W'] = self._language_cortex.wernicke._W
+            payload['lang_wernicke_b'] = self._language_cortex.wernicke._b
+            ctx_buf = self._language_cortex.wernicke._context_buf
+            if ctx_buf:
+                payload['lang_wernicke_context_buf'] = np.stack(ctx_buf)
+            payload['lang_broca_W_prod'] = self._language_cortex.broca._W_prod
+            payload['lang_broca_W_stack'] = self._language_cortex.broca._W_stack
+            payload['lang_broca_W_arcuate'] = self._language_cortex.broca._W_arcuate
+
+            # Cross-modal binder weights
+            for key, val in self._cross_modal_binder._W.items():
+                payload[f'cmb_W_{key[0]}_{key[1]}'] = val
+
+            # Dialogue ToM weights
+            if self._tom.dialogue is not None:
+                payload['tom_dialogue_W_mentalise'] = self._tom.dialogue._W_mentalise
+                payload['tom_dialogue_W_affect'] = self._tom.dialogue._W_affect
+                payload['tom_dialogue_topic'] = self._tom.dialogue.interlocutor_topic
+                payload['tom_dialogue_belief'] = self._tom.dialogue.belief_about_other_knowledge
+                payload['tom_dialogue_affect'] = self._tom.dialogue.simulated_affect
+                hist = list(self._tom.dialogue._history)
+                if hist:
+                    payload['tom_dialogue_history'] = np.stack(hist)
+
+            # PFC working memory state
+            if self._pfc.dialogue_wm is not None:
+                payload['pfc_dialogue_wm_context'] = self._pfc.dialogue_wm.context_vector
+                payload['pfc_dialogue_wm_drive'] = np.array(self._pfc.dialogue_wm.communicative_drive)
+                wm_buf = self._pfc.dialogue_wm._buffer
+                if wm_buf:
+                    payload['pfc_dialogue_wm_vectors'] = np.stack([e['vector'] for e in wm_buf])
+                    payload['pfc_dialogue_wm_strengths'] = np.array([e['strength'] for e in wm_buf])
+                    payload['pfc_dialogue_wm_roles'] = np.array([e['role'] for e in wm_buf])
+
             np.savez_compressed(str(d / 'weights.npz'), **payload)
 
             meta = {
@@ -418,11 +515,27 @@ class Brain:
                 'active_limit':    int(self._plasticity.active_limit),
                 'wellbeing':       self.wellbeing,
                 'mood':            self.mood,
+                'rehab_ticks_left': self._rehab_ticks_left,
                 'age_ticks':       self._plasticity._age_ticks,
                 'habenula_expect': self._habenula._expected_reward,
                 'pfc_monitoring':  self._pfc_monitoring_strength,
             }
             (d / 'brain.json').write_text(json.dumps(meta, indent=2))
+
+            # Append metadata log entry (JSONL format)
+            try:
+                import datetime
+                log_entry = {
+                    'timestamp': datetime.datetime.now().isoformat(),
+                    'tick': self.tick,
+                    'phase': getattr(world, '_phase', 'unknown') if world is not None else 'unknown',
+                    'wellbeing': self.wellbeing,
+                    'mood': self.mood
+                }
+                with open(d / 'metadata.jsonl', 'a', encoding='utf-8') as lf:
+                    lf.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+            except Exception:
+                pass
 
             # Hippocampal subfields — episodic memory + CA3 attractor
             hipp_state = {
@@ -440,6 +553,17 @@ class Brain:
                                  self._entorhinal._concept_pos.items()},
             }
             (d / 'entorhinal.json').write_text(json.dumps(ento_state))
+
+            # Basal Ganglia, Somatic Markers & Endocrine Pavlovian weights (behavior state)
+            behavior_state = {
+                'direct_weights': self._basal_ganglia.direct_weights,
+                'indirect_weights': self._basal_ganglia.indirect_weights,
+                'somatic_markers': self._free_will.somatic_markers_pain,
+            }
+            if self._chemistry is not None and hasattr(self._chemistry, 'sound_to_dopamine_weights'):
+                behavior_state['sound_to_dopamine'] = self._chemistry.sound_to_dopamine_weights
+                behavior_state['sound_to_fear'] = self._chemistry.sound_to_fear_weights
+            np.savez_compressed(str(d / 'behavior.npz'), **behavior_state)
 
             print(f'>>> Мозг сохранён в {d}/')
         except Exception as e:
@@ -460,15 +584,102 @@ class Brain:
                 data['weights'], dtype=torch.float32, device=dev)
             self._plasticity.integrity_values = torch.tensor(
                 data['integrity'], dtype=torch.float32, device=dev)
-            # Astrocyte slow EMA — load if present
             if 'astro_slow' in data.files:
                 self._astrocytes._slow_weights = torch.tensor(
                     data['astro_slow'], dtype=torch.float32, device=dev)
+            if 'astro_avg_act' in data.files:
+                self._astrocytes._avg_activity = torch.tensor(
+                    data['astro_avg_act'], dtype=torch.float32, device=dev)
+
+            # Predictive hierarchy weights
+            if 'pred_td_indices' in data.files:
+                self._predictor.td_indices = torch.tensor(
+                    data['pred_td_indices'], dtype=torch.long, device=dev)
+            if 'pred_td_values' in data.files:
+                self._predictor.td_values = torch.tensor(
+                    data['pred_td_values'], dtype=torch.float32, device=dev)
+                self._predictor._W_top = None
+            if 'pred_bu_indices' in data.files:
+                self._predictor.bu_indices = torch.tensor(
+                    data['pred_bu_indices'], dtype=torch.long, device=dev)
+            if 'pred_bu_values' in data.files:
+                self._predictor.bu_values = torch.tensor(
+                    data['pred_bu_values'], dtype=torch.float32, device=dev)
+                self._predictor._W_bot = None
+            if 'pred_td_perm' in data.files:
+                self._predictor.td_perm = torch.tensor(
+                    data['pred_td_perm'], dtype=torch.long, device=dev)
+            if 'pred_bu_perm' in data.files:
+                self._predictor.bu_perm = torch.tensor(
+                    data['pred_bu_perm'], dtype=torch.long, device=dev)
+
+            # Language cortex weights
+            if 'lang_wernicke_W' in data.files:
+                self._language_cortex.wernicke._W = data['lang_wernicke_W'].copy()
+            if 'lang_wernicke_b' in data.files:
+                self._language_cortex.wernicke._b = data['lang_wernicke_b'].copy()
+            if 'lang_wernicke_context_buf' in data.files:
+                ctx_buf = data['lang_wernicke_context_buf']
+                if ctx_buf.ndim > 1:
+                    self._language_cortex.wernicke._context_buf = list(ctx_buf)
+                else:
+                    self._language_cortex.wernicke._context_buf = []
+            if 'lang_broca_W_prod' in data.files:
+                self._language_cortex.broca._W_prod = data['lang_broca_W_prod'].copy()
+            if 'lang_broca_W_stack' in data.files:
+                self._language_cortex.broca._W_stack = data['lang_broca_W_stack'].copy()
+            if 'lang_broca_W_arcuate' in data.files:
+                self._language_cortex.broca._W_arcuate = data['lang_broca_W_arcuate'].copy()
+
+            # Cross-modal binder weights
+            for key in self._cross_modal_binder._W.keys():
+                w_key = f'cmb_W_{key[0]}_{key[1]}'
+                if w_key in data.files:
+                    self._cross_modal_binder._W[key] = data[w_key].copy()
+
+            # Dialogue ToM weights
+            if self._tom.dialogue is not None:
+                if 'tom_dialogue_W_mentalise' in data.files:
+                    self._tom.dialogue._W_mentalise = data['tom_dialogue_W_mentalise'].copy()
+                if 'tom_dialogue_W_affect' in data.files:
+                    self._tom.dialogue._W_affect = data['tom_dialogue_W_affect'].copy()
+                if 'tom_dialogue_topic' in data.files:
+                    self._tom.dialogue.interlocutor_topic = data['tom_dialogue_topic'].copy()
+                if 'tom_dialogue_belief' in data.files:
+                    self._tom.dialogue.belief_about_other_knowledge = data['tom_dialogue_belief'].copy()
+                if 'tom_dialogue_affect' in data.files:
+                    self._tom.dialogue.simulated_affect = data['tom_dialogue_affect'].copy()
+                if 'tom_dialogue_history' in data.files:
+                    hist = data['tom_dialogue_history']
+                    self._tom.dialogue._history.clear()
+                    if hist.ndim > 1:
+                        for h in hist:
+                            self._tom.dialogue._history.append(h)
+
+            # PFC working memory state
+            if self._pfc.dialogue_wm is not None:
+                if 'pfc_dialogue_wm_context' in data.files:
+                    self._pfc.dialogue_wm.context_vector = data['pfc_dialogue_wm_context'].copy()
+                if 'pfc_dialogue_wm_drive' in data.files:
+                    self._pfc.dialogue_wm.communicative_drive = float(data['pfc_dialogue_wm_drive'])
+                if 'pfc_dialogue_wm_vectors' in data.files:
+                    vectors = data['pfc_dialogue_wm_vectors']
+                    strengths = data['pfc_dialogue_wm_strengths']
+                    roles = data['pfc_dialogue_wm_roles']
+                    self._pfc.dialogue_wm._buffer = []
+                    if vectors.ndim > 1:
+                        for i in range(len(vectors)):
+                            self._pfc.dialogue_wm._buffer.append({
+                                'vector': vectors[i].copy(),
+                                'strength': float(strengths[i]),
+                                'role': str(roles[i]),
+                            })
             if json_path.exists():
                 meta = json.loads(json_path.read_text())
                 self.tick      = meta.get('tick', 0)
                 self.mood      = meta.get('mood', 'calm')
                 self.wellbeing = meta.get('wellbeing', 1.0)
+                self._rehab_ticks_left = meta.get('rehab_ticks_left', 0)
                 if 'active_limit'    in meta: self._plasticity.active_limit = meta['active_limit']
                 if 'age_ticks'       in meta: self._plasticity._age_ticks   = meta['age_ticks']
                 if 'habenula_expect' in meta: self._habenula._expected_reward = meta['habenula_expect']
@@ -490,6 +701,21 @@ class Brain:
                     int(k): np.asarray(v, dtype=np.float32)
                     for k, v in es.get('concept_pos', {}).items()
                 }
+            # Basal Ganglia, Somatic Markers & Endocrine Pavlovian weights
+            behavior_p = d / 'behavior.npz'
+            if behavior_p.exists():
+                bd = np.load(str(behavior_p), allow_pickle=True)
+                if 'direct_weights' in bd:
+                    self._basal_ganglia.direct_weights = bd['direct_weights']
+                if 'indirect_weights' in bd:
+                    self._basal_ganglia.indirect_weights = bd['indirect_weights']
+                if 'somatic_markers' in bd:
+                    self._free_will.somatic_markers_pain = bd['somatic_markers']
+                    self._free_will._prev_markers = np.zeros_like(bd['somatic_markers'])
+                if 'sound_to_dopamine' in bd and self._chemistry is not None and hasattr(self._chemistry, 'sound_to_dopamine_weights'):
+                    self._chemistry.sound_to_dopamine_weights = bd['sound_to_dopamine']
+                if 'sound_to_fear' in bd and self._chemistry is not None and hasattr(self._chemistry, 'sound_to_fear_weights'):
+                    self._chemistry.sound_to_fear_weights = bd['sound_to_fear']
             print(f'>>> Мозг загружен из {d}/ (тик {self.tick})')
             return True
         except Exception as e:
@@ -551,6 +777,7 @@ class Brain:
         headless:  bool = False,
         save_path: str | None = None,
         max_ticks: int | None = None,
+        checkpoint_interval: int | None = None,
     ) -> None:
         """Run the simulation loop.
 
@@ -564,6 +791,8 @@ class Brain:
             Override ``self.save_path`` for this run.
         max_ticks:
             Stop after N ticks (None = run until quit or death).
+        checkpoint_interval:
+            Save the brain every N ticks (None = no periodic saves).
         """
         from mindai.environment.hearing_system import Cochlea
 
@@ -613,7 +842,6 @@ class Brain:
                 self.tick += 1
                 if max_ticks and self.tick > max_ticks:
                     break
-
                 # --- input & speed -------------------------------------------
                 keys_pressed = {}
                 quit_sim     = False
@@ -630,96 +858,18 @@ class Brain:
                 if self._sleep.is_sleeping:
                     world.process_human_input(keys_pressed)
 
-                    # Semantic concept tagging is an N2 phenomenon (Diekelmann 2010)
-                    if self._sleep.current_phase == SleepPhase.N2 and self.tick % 50 == 0:
-                        self._semantics.extract_concept_during_sleep(
-                            self._workspace.history_buffer, self._plasticity)
-
-                    sleep_pressure = self._clock.adenosine * 0.5 + self._clock.melatonin * 0.5
-                    sleep_result = self._sleep.process_sleep_tick(
-                        hippocampus=self._hippocampus,
-                        plasticity=self._plasticity,
-                        current_cortisol=getattr(chem, 'cortisol', 0.0),
-                        current_activity_np=self._activity.cpu().numpy(),
-                        sleep_pressure=sleep_pressure,
-                        pfc_monitoring_strength=self._pfc_monitoring_strength,
-                    )
-
-                    # Drive neuromodulators toward phase-correct biological targets (5% lerp/tick)
-                    targets = sleep_result.neuromod_targets
-                    _lerp = lambda cur, tgt: cur + (tgt - cur) * 0.05
-                    if self._chemistry is not None:
-                        self._chemistry.acetylcholine = float(
-                            np.clip(_lerp(chem.acetylcholine, targets['acetylcholine']), 0.0, 1.0))
-                        self._chemistry.noradrenaline = float(
-                            np.clip(_lerp(chem.noradrenaline, targets['noradrenaline']), 0.0, 1.0))
-                        self._chemistry.serotonin = float(
-                            np.clip(_lerp(chem.serotonin,     targets['serotonin']),     0.0, 1.0))
-                        self._chemistry.anandamide = float(
-                            np.clip(_lerp(chem.anandamide,    targets['anandamide']),    0.0, 1.0))
-
-                    # REM: overwrite activity with dream tensor (already on device — no second transfer)
-                    if (sleep_result.current_phase == SleepPhase.REM
-                            and sleep_result.dream_tensor is not None):
-                        self._activity = sleep_result.dream_tensor
-
-                    # Lucid dream: dlPFC re-engages during REM (LaBerge 1985; Voss 2009)
-                    # PFC goal vector biases dream content toward current homeostatic
-                    # needs — the brain can "intend" within the dream.
-                    # EgoModel receives dream activity so self-model updates.
-                    # This is not scripted dream control — it's the same PFC→motor
-                    # pathway active during waking, now operating on dream imagery.
-                    if sleep_result.is_lucid:
-                        if not getattr(self, '_was_lucid', False):
-                            print(f'\n    [ОСОЗНАННЫЙ СОН] Тик {self.tick} — '
-                                  f'dlPFC реактивирована в REM. '
-                                  f'Мониторинг={self._pfc_monitoring_strength:.3f}')
-                            self._was_lucid = True
-                        # PFC goal biases dream activity
-                        pfc_goal = self._pfc.formulate_goal(
-                            energy=getattr(self, '_last_h_ratio', 0.5),
-                            water=getattr(self, '_last_w_ratio', 0.5),
-                            base_resource=1.0,
+                    # Spawn background sleep consolidation thread if not already running
+                    if getattr(self, '_sleep_thread', None) is None or not self._sleep_thread.is_alive():
+                        import threading
+                        self._sleep_thread = threading.Thread(
+                            target=self._run_sleep_cycle,
+                            args=(world, chem, sp_path),
+                            daemon=True
                         )
-                        if pfc_goal.any():
-                            pfc_t = torch.tensor(
-                                pfc_goal, dtype=torch.float32, device=self._device)
-                            self._activity = torch.clamp(
-                                self._activity + pfc_t * 0.2, 0.0, 1.0)
-                        # EgoModel: self-model updates during lucid REM
-                        act_np = self._activity.cpu().numpy()
-                        self._ego.evaluate_self(self.wellbeing,
-                                                float(np.mean(act_np)))
-                    else:
-                        self._was_lucid = False
+                        self._sleep_thread.start()
 
-                    # CAR: anticipatory cortisol pulse before natural wake
-                    if self._clock.car_cortisol_boost > 0 and self._chemistry is not None:
-                        self._chemistry.cortisol = float(
-                            np.clip(chem.cortisol + self._clock.car_cortisol_boost * 0.01, 0.0, 1.0))
-
-                    # Phase label in mood field (visible in UI stats)
-                    _phase_labels = {
-                        SleepPhase.N1:  'СОН N1 (засыпание)',
-                        SleepPhase.N2:  'СОН N2 (веретёна)',
-                        SleepPhase.N3:  'СОН N3 (SWS/дельта)',
-                        SleepPhase.REM: 'REM: СНОВИДЕНИЕ',
-                    }
-                    if (sleep_result.current_phase == SleepPhase.REM
-                            and sleep_result.is_lucid):
-                        self.mood = 'REM: ОСОЗНАННЫЙ СОН ✦'
-                    else:
-                        self.mood = _phase_labels[sleep_result.current_phase]
-
-                    if not sleep_result.still_sleeping:
-                        self._clock.is_awake  = True
-                        self._clock.adenosine = 0.0
-                        self._sleep.is_sleeping = False
-                        # Restore awake baselines
-                        if self._chemistry is not None:
-                            self._chemistry.acetylcholine = 0.5
-                            self._chemistry.noradrenaline = 0.1
-                            self._chemistry.serotonin     = 0.5
+                    time.sleep(0.016)  # Yield CPU in main thread to keep UI/Pygame responsive (60 FPS)
+                    continue
 
                 # === AWAKE PATH ===============================================
                 else:
@@ -760,15 +910,23 @@ class Brain:
                     raw = _raw_np
                     raw[:] = 0.0
 
-                    # Vision
+                    # Vision / sensory channels from world
                     retina_data = world.get_sensory_retina(self.num_neurons)
-                    raw[:len(retina_data)] = retina_data
+                    if isinstance(retina_data, dict):
+                        for channel, data in retina_data.items():
+                            if layout.has(channel):
+                                slice_dest = layout.slice(channel)
+                                slice_len = layout.size(channel)
+                                raw[slice_dest] = np.pad(data, (0, max(0, slice_len - len(data))))[:slice_len]
+                    else:
+                        raw[:len(retina_data)] = retina_data
 
                     # Biological motion detection — MT+/V5 (Grossman & Blake 2002)
                     # Score in [0,1]: how much the visual input looks like biological
                     # motion (smooth trajectories + structured variance + periodicity).
                     # Used below to gate mirror-neuron STDP.
-                    _bio_motion_score = self._motion_detector.update(retina_data)
+                    _vis_data = raw[_sl_vision] if _sl_vision is not None else np.zeros(0)
+                    _bio_motion_score = self._motion_detector.update(_vis_data)
 
                     # PFC goal vector — vlPFC/OFC homeostatic bias (Wallis 2007)
                     # formulate_goal() returns a sparse vector with 1.0 at goal neurons;
@@ -900,7 +1058,7 @@ class Brain:
                     # Axonal delays: add PSPs that arrived this tick from past spikes
                     delayed_psp = self._delay_queue.dequeue()
                     # Schedule current activity into future slots (STP-scaled weights)
-                    brain_w_stp = self._plasticity.get_sparse_weights(apply_stp=True)
+                    eff_weights = self._plasticity.get_stp_scaled_weights()
                     # Rebuild edge-delay tensor if synaptogenesis/pruning changed topology
                     n_edges = self._plasticity.indices.shape[1]
                     if self._edge_delays.shape[0] != n_edges:
@@ -914,7 +1072,7 @@ class Brain:
                         self._activity,
                         self._plasticity.indices[0],
                         self._plasticity.indices[1],
-                        brain_w_stp._values(),
+                        eff_weights,
                         self._edge_delays,
                     )
                     # Step STP state for next tick
@@ -1019,7 +1177,7 @@ class Brain:
 
                     # Visuospatial sketchpad — spatial working memory (Baddeley 1986)
                     # retina_data from step 2 above — vision channel
-                    self._visuospatial.update(retina_data if _sl_vision else np.zeros(1))
+                    self._visuospatial.update(raw[_sl_vision] if _sl_vision is not None else np.zeros(1))
 
                     # DMN — self-referential / autobiographical replay (Raichle 2001)
                     dmn_out = self._dmn.update(
@@ -1037,6 +1195,151 @@ class Brain:
                             human_interacted=human_interacted,
                             threat_signal=self._amygdala.threat_level,
                         )
+
+                    # LanguageCortex + CrossModalBinder + dlPFC WorkingMemory
+                    # Runs every tick so the system continuously processes the
+                    # current sensory state as a "token" in semantic space.
+                    # When text arrives the SDR gives a proper sparse code;
+                    # otherwise the dominant neural activity vector is used.
+                    # ----------------------------------------------------------
+
+                    # --- dlPFC: decay WM + retrieve context ---
+                    # Goldman-Rakic (1995): each tick corresponds to ~100ms;
+                    # WM decays exponentially without active rehearsal.
+                    _dlpfc_wm = self._pfc.dialogue_wm
+                    if _dlpfc_wm is not None:
+                        _dlpfc_wm.decay()
+                        # Retrieve context cued by current neural state
+                        _dlpfc_ctx = _dlpfc_wm.retrieve(
+                            self._language_cortex.semantic_vector)
+                        # Active rehearsal: refresh item closest to current state
+                        _dlpfc_wm.rehearse(self._language_cortex.semantic_vector)
+                    else:
+                        _dlpfc_ctx = None
+
+                    _text_tok = world.get_text_token() if hasattr(world, 'get_text_token') else None
+                    if _text_tok is not None:
+                        # Text input available — encode as SDR
+                        _tok_arr = np.array([_text_tok], dtype=np.float32)
+                        _tok_sdr = self._sdr_encoder.encode(_tok_arr)
+                    else:
+                        # No text: use top-K of current neural activity as implicit token
+                        _tok_sdr = self._sdr_encoder.encode(act_cpu)
+
+                    _grid_act = self._entorhinal.get_grid_activity()
+
+                    # Sentence boundary: triggered by long silence or punctuation
+                    _sentence_end = (
+                        getattr(world, 'is_sentence_boundary', False) or
+                        (self.tick % 50 == 0)  # fallback: every 5 s at 10 Hz
+                    )
+
+                    # --- LanguageCortex: process with dlPFC back-projection ---
+                    # Petrides & Pandya (1988): BA46/9 → BA22 top-down connection
+                    # injects dialogue context into Wernicke's semantic computation.
+                    _lang_out = self._language_cortex.process(
+                        token_embedding   = _tok_sdr,
+                        grid_activity     = _grid_act,
+                        target_token      = _text_tok,
+                        plasticity_rate   = getattr(chem, 'acetylcholine', 0.5),
+                        sentence_boundary = _sentence_end,
+                        dlpfc_context     = _dlpfc_ctx,
+                    )
+
+                    # Store agent's current semantic state into dlPFC WM
+                    # (every sentence boundary or every ~5 s)
+                    if _dlpfc_wm is not None and _sentence_end:
+                        _dlpfc_wm.store(_lang_out['semantic_vector'], role='self')
+
+                    # Cross-modal binding — fire when multiple modalities present
+                    _intero_vec = np.array([
+                        world_signals.get('pain',   0.0),
+                        world_signals.get('hunger', 0.0),
+                        world_signals.get('thirst', 0.0),
+                        float(np.mean(act_cpu)),
+                    ], dtype=np.float32)
+                    _vis_vec  = act_cpu[_sl_vision] if _sl_vision is not None else np.zeros(self._lang_vision_dim)
+                    _aud_vec  = act_cpu[_sl_audio]  if _sl_audio  is not None else np.zeros(self._lang_audio_dim)
+                    _bind_recall = self._cross_modal_binder.update({
+                        'text':         _tok_sdr,
+                        'audio':        _aud_vec,
+                        'vision':       _vis_vec,
+                        'interoception': _intero_vec,
+                    })
+                    # Recalled cross-modal signal reinforces the text column
+                    _text_recall = _bind_recall.get('text', None)
+                    if _text_recall is not None and _text_recall.any():
+                        # Blend recalled multimodal signal back into SDR encoder
+                        self._sdr_encoder.update_reconstruction(_tok_sdr, _text_recall)
+
+                    # Dialogue ToM update — called when an interlocutor speaks
+                    _interlocutor_text = getattr(world, 'last_interlocutor_token', None)
+                    _knowledge_gap = 0.0
+                    if (_interlocutor_text is not None
+                            and self._tom.dialogue is not None):
+                        _inter_sdr = self._sdr_encoder.encode(
+                            np.array([_interlocutor_text], dtype=np.float32))
+                        _inter_sem = self._language_cortex.wernicke.process(
+                            token_embedding = _inter_sdr,
+                            grid_activity   = _grid_act,
+                            plasticity_rate = 0.0,   # observe only, no self-update
+                            dlpfc_context   = _dlpfc_ctx,
+                        )
+                        # Store interlocutor's utterance into dlPFC WM
+                        if _dlpfc_wm is not None:
+                            _dlpfc_wm.store(_inter_sem, role='other')
+
+                        # Build agent feeling vector for simulation theory
+                        _agent_feel = np.array([
+                            getattr(chem, 'dopamine', 0.5) - 0.5,   # valence proxy
+                            getattr(chem, 'noradrenaline', 0.5),     # arousal proxy
+                        ], dtype=np.float32)
+                        _tom_out = self._tom.dialogue.update_from_utterance(
+                            observed_semantic = _inter_sem,
+                            agent_semantic    = _lang_out['semantic_vector'],
+                            agent_feeling     = _agent_feel,
+                            plasticity_rate   = getattr(chem, 'acetylcholine', 0.5),
+                        )
+
+                        _knowledge_gap = _tom_out.get('knowledge_gap', 0.0)
+
+                    # --- Communicative intent (ACC-gated dlPFC drive) ---
+                    # Indefrey & Levelt (2004): speech triggered when SMA readiness
+                    # potential exceeds threshold.  Here: communicative_drive >
+                    # _COMM_DRIVE_THRESHOLD AND agent not in homeostatic crisis.
+                    _just_spoke = False
+                    if _dlpfc_wm is not None:
+                        _comm_drive = _dlpfc_wm.update_communicative_drive(
+                            surprise      = self.surprise,
+                            knowledge_gap = _knowledge_gap,
+                            dopamine_meso = getattr(chem, 'dopamine_mesocortical', 0.5),
+                            just_spoke    = _just_spoke,
+                        )
+                        # Trigger generation when drive is high AND agent is not
+                        # distracted by homeostatic crisis (goal_persistence low)
+                        _can_speak = (
+                            _comm_drive > _COMM_DRIVE_THRESHOLD and
+                            self._pfc.goal_persistence < 0.8 and
+                            not self._pag.is_immobile   # PAG freeze blocks speech
+                        )
+                        if _can_speak:
+                            _utterance_tokens = self._language_cortex.generate_utterance(
+                                grid_activity = _grid_act,
+                                sdr_encoder   = self._sdr_encoder,
+                                dlpfc_context = _dlpfc_ctx,
+                            )
+                            if _utterance_tokens:
+                                # Pass tokens to world for rendering/output
+                                if hasattr(world, 'receive_agent_tokens'):
+                                    world.receive_agent_tokens(_utterance_tokens)
+                                # Store generated utterance back into WM
+                                if _dlpfc_wm is not None:
+                                    _dlpfc_wm.store(
+                                        _lang_out['semantic_vector'], role='self')
+                                # Reset drive: information has been transmitted
+                                _dlpfc_wm.update_communicative_drive(
+                                    surprise=0.0, knowledge_gap=0.0,
+                                    dopamine_meso=0.5, just_spoke=True)
 
                     # Neural complexity (every 100 ticks)
                     # LZ76 complexity + spectral radius via GPU power iteration.
@@ -1219,6 +1522,16 @@ class Brain:
                     # ----------------------------------------------------------
                     # 8. Plasticity & learning
                     # ----------------------------------------------------------
+                    # --- Rehabilitation Mode ---
+                    rehab_active = (self._rehab_ticks_left > 0)
+                    if rehab_active:
+                        self._rehab_ticks_left -= 1
+                        chem.acetylcholine = max(1.0, chem.acetylcholine)
+                        chem.dopamine = max(1.0, chem.dopamine)
+                        chem.dopamine_mesocortical = max(1.0, chem.dopamine_mesocortical)
+                        if self.tick % 50 == 0:
+                            print(f'>>> [РЕАБИЛИТАЦИЯ] Оставшееся время реабилитации: {self._rehab_ticks_left} тиков.')
+
                     pain_suppression = max(0.0, 1.0 - raw_pain_for_chem)
                     # Mood gate: depression suppresses LTP rate (Castrén 2005)
                     mood_ltp_gate = 0.5 if self.mood == 'depression' else 1.0
@@ -1226,7 +1539,8 @@ class Brain:
                                         * pain_suppression * mood_ltp_gate)
                     self._plasticity.apply_stdp_learning(
                         self._activity, plasticity_rate,
-                        acetylcholine=getattr(chem, 'acetylcholine', 0.5))
+                        acetylcholine=getattr(chem, 'acetylcholine', 0.5),
+                        dopamine=getattr(chem, 'dopamine', 0.5))
 
                     # Mirror neuron STDP gate — three-factor amplification:
                     #   1. mirror_neuron_amplifier: oxytocin + NA inverted-U + insula/amygdala
@@ -1259,22 +1573,24 @@ class Brain:
                             mirror_activity[~mask] = 0.0
                             self._plasticity.apply_stdp_learning(
                                 mirror_activity, mirror_rate,
-                                acetylcholine=getattr(chem, 'acetylcholine', 0.5))
+                                acetylcholine=getattr(chem, 'acetylcholine', 0.5),
+                                dopamine=getattr(chem, 'dopamine', 0.5))
 
                     # Astrocytes: slow weight-stability layer (Fusi 2005 cascade)
                     # Pulls inactive synapses toward their slow EMA — preserves
                     # long-term memory without blocking fast STDP (Volterra 2005)
+                    rehab_loops = 5 if rehab_active else 1
+                    for _ in range(rehab_loops):
+                        self._plasticity.synaptogenesis_and_pruning(
+                            self._activity, self.wellbeing * 3000)
+                    if self.tick % 100 == 0:
+                        self._plasticity.maintain_homeostasis()
                     self._plasticity.weights_values = self._astrocytes.step(
                         self._plasticity.weights_values,
                         self._plasticity.indices[0],
                         self._plasticity.indices[1],
                         self._activity,
                     )
-
-                    self._plasticity.synaptogenesis_and_pruning(
-                        self._activity, self.wellbeing * 3000)
-                    if self.tick % 100 == 0:
-                        self._plasticity.maintain_homeostasis()
 
                     # Neurogenesis — triggered by surprise (Eriksson 1998; Bhagya 2011)
                     # High prediction error → epistemic hunger → hippocampal neurogenesis
@@ -1300,6 +1616,11 @@ class Brain:
                     if not self._clock.is_awake and not self._sleep.is_sleeping:
                         self._sleep.is_sleeping = True
                         self._sleep.begin_sleep(self._hippocampus)
+
+                    # Periodic checkpoint check
+                    if checkpoint_interval is not None and self.tick % checkpoint_interval == 0 and self.tick > 0:
+                        print(f'\n>>> [CHECKPOINT] Автосохранение на тике {self.tick:,}...')
+                        self.save(sp_path, world=world)
 
                 # === RENDER ==================================================
                 if ui is not None and self.tick % 2 == 0:
@@ -1347,11 +1668,107 @@ class Brain:
             if ear is not None and hasattr(ear, 'stream') and ear.stream is not None:
                 ear.stream.stop()
             if world.is_alive():
-                self.save(sp_path)
+                self.save(sp_path, world=world)
 
     # -------------------------------------------------------------------------
     # Helpers
     # -------------------------------------------------------------------------
+
+    def _run_sleep_cycle(self, world, chem, sp_path):
+        import time
+        from mindai.lifecycle.sleep_consolidation import SleepPhase
+        while self._sleep.is_sleeping:
+            # Semantic concept tagging is an N2 phenomenon (Diekelmann 2010)
+            if self._sleep.current_phase == SleepPhase.N2 and self.tick % 50 == 0:
+                self._semantics.extract_concept_during_sleep(
+                    self._workspace.history_buffer, self._plasticity)
+                self._workspace.history_buffer.clear()
+
+            sleep_pressure = self._clock.adenosine * 0.5 + self._clock.melatonin * 0.5
+            sleep_result = self._sleep.process_sleep_tick(
+                hippocampus=self._hippocampus,
+                plasticity=self._plasticity,
+                current_cortisol=getattr(chem, 'cortisol', 0.0),
+                current_activity_np=self._activity.cpu().numpy(),
+                sleep_pressure=sleep_pressure,
+                pfc_monitoring_strength=self._pfc_monitoring_strength,
+            )
+
+            # Drive neuromodulators toward phase-correct biological targets (5% lerp/tick)
+            targets = sleep_result.neuromod_targets
+            _lerp = lambda cur, tgt: cur + (tgt - cur) * 0.05
+            if self._chemistry is not None:
+                self._chemistry.acetylcholine = float(
+                    np.clip(_lerp(chem.acetylcholine, targets['acetylcholine']), 0.0, 1.0))
+                self._chemistry.noradrenaline = float(
+                    np.clip(_lerp(chem.noradrenaline, targets['noradrenaline']), 0.0, 1.0))
+                self._chemistry.serotonin = float(
+                    np.clip(_lerp(chem.serotonin,     targets['serotonin']),     0.0, 1.0))
+                self._chemistry.anandamide = float(
+                    np.clip(_lerp(chem.anandamide,    targets['anandamide']),    0.0, 1.0))
+
+            # REM: overwrite activity with dream tensor (already on device)
+            if (sleep_result.current_phase == SleepPhase.REM
+                    and sleep_result.dream_tensor is not None):
+                self._activity = sleep_result.dream_tensor
+
+            # Lucid dream: dlPFC re-engages during REM (LaBerge 1985; Voss 2009)
+            if sleep_result.is_lucid:
+                if not getattr(self, '_was_lucid', False):
+                    print(f'\n    [ОСОЗНАННЫЙ СОН] Тик {self.tick} — '
+                          f'dlPFC реактивирована в REM. '
+                          f'Мониторинг={self._pfc_monitoring_strength:.3f}')
+                    self._was_lucid = True
+                # PFC goal biases dream activity
+                pfc_goal = self._pfc.formulate_goal(
+                    energy=getattr(self, '_last_h_ratio', 0.5),
+                    water=getattr(self, '_last_w_ratio', 0.5),
+                    base_resource=1.0,
+                )
+                if pfc_goal.any():
+                    pfc_t = torch.tensor(
+                        pfc_goal, dtype=torch.float32, device=self._device)
+                    self._activity = torch.clamp(
+                        self._activity + pfc_t * 0.2, 0.0, 1.0)
+                # EgoModel: self-model updates during lucid REM
+                act_np = self._activity.cpu().numpy()
+                self._ego.evaluate_self(self.wellbeing, float(np.mean(act_np)))
+            else:
+                self._was_lucid = False
+
+            # CAR: anticipatory cortisol pulse before natural wake
+            if self._clock.car_cortisol_boost > 0 and self._chemistry is not None:
+                self._chemistry.cortisol = float(
+                    np.clip(chem.cortisol + self._clock.car_cortisol_boost * 0.01, 0.0, 1.0))
+
+            # Phase label in mood field (visible in UI stats)
+            _phase_labels = {
+                SleepPhase.N1:  'СОН N1 (засыпание)',
+                SleepPhase.N2:  'СОН N2 (веретёна)',
+                SleepPhase.N3:  'СОН N3 (SWS/дельта)',
+                SleepPhase.REM: 'REM: СНОВИДЕНИЕ',
+            }
+            if sleep_result.current_phase in _phase_labels:
+                if (sleep_result.current_phase == SleepPhase.REM
+                        and sleep_result.is_lucid):
+                    self.mood = 'REM: ОСОЗНАННЫЙ СОН ✦'
+                else:
+                    self.mood = _phase_labels[sleep_result.current_phase]
+
+            if not sleep_result.still_sleeping:
+                self._clock.is_awake  = True
+                self._clock.adenosine = 0.0
+                self._sleep.is_sleeping = False
+                # Restore awake baselines
+                if self._chemistry is not None:
+                    self._chemistry.acetylcholine = 0.5
+                    self._chemistry.noradrenaline = 0.1
+                    self._chemistry.serotonin     = 0.5
+                print(f'\n>>> ПРОБУЖДЕНИЕ ОРГАНИЗМА (Тик {self.tick}).')
+
+            self.tick += 1
+            # Control pacing to keep CPU usage reasonable while processing
+            time.sleep(0.005)
 
     def _delete_save(self, path: str) -> None:
         """Delete brain save (called on death — world save is not deleted)."""
@@ -1360,7 +1777,7 @@ class Brain:
                 os.remove(path)
         else:
             d = Path(path)
-            for name in ('brain.json', 'weights.npz'):
+            for name in ('brain.json', 'weights.npz', 'hippocampus.npz', 'entorhinal.json', 'metadata.jsonl', 'behavior.npz'):
                 f = d / name
                 if f.exists():
                     f.unlink()

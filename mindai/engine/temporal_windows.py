@@ -36,8 +36,8 @@ import torch
 class TemporalIntegration:
     """Theta/gamma-scale cortical temporal integration."""
 
-    def __init__(self, num_nodes: int, window_size: int = 5):
-        self.device      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    def __init__(self, num_nodes: int, window_size: int = 5, device: torch.device | None = None):
+        self.device      = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.num_nodes   = num_nodes
         self.window_size = window_size
         self.retention_buffer = torch.zeros(

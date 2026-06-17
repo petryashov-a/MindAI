@@ -36,8 +36,10 @@ class StructuralPlasticity:
         num_nodes:        int,
         initial_density:  float = 0.01,
         inhibitory_ratio: float = 0.2,
+        device:           torch.device | None = None,
+        coordinates:      np.ndarray | None = None,
     ):
-        self.device           = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device           = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.num_nodes        = num_nodes
         # Neonatal cortex: ~20% of neurons active at birth, matures to ~80% max.
         # Neurogenesis (trigger_neurogenesis) gradually unlocks the rest.
@@ -57,17 +59,43 @@ class StructuralPlasticity:
         print(f'    [БИОЛОГИЯ] Выращивание графа на {self.device}. '
               f'80% Глутамат / 20% ГАМК...')
 
+        # Load coordinates
+        if coordinates is not None:
+            self.coordinates = torch.from_numpy(coordinates).to(self.device)
+        else:
+            # Fallback coordinate generation
+            idx = np.arange(num_nodes, dtype=np.float64)
+            phi = np.arccos(1.0 - 2.0 * (idx + 0.5) / num_nodes)
+            theta = np.pi * (1.0 + 5.0 ** 0.5) * idx
+            sin_phi = np.sin(phi)
+            coords = np.empty((num_nodes, 3), dtype=np.float32)
+            coords[:, 0] = 10.0 * np.cos(theta) * sin_phi
+            coords[:, 1] = 10.0 * np.sin(theta) * sin_phi
+            coords[:, 2] = 10.0 * np.cos(phi)
+            self.coordinates = torch.from_numpy(coords).to(self.device)
+
         self.is_inhibitory_tensor = torch.rand(num_nodes, device=self.device) < inhibitory_ratio
         self.is_inhibitory        = self.is_inhibitory_tensor.cpu().numpy()
 
         num_connections = int(self.active_limit * self.active_limit * initial_density)
-        indices = torch.randint(0, self.active_limit, (2, num_connections), device=self.device)
-        mask    = indices[0] != indices[1]
-        self.indices = indices[:, mask]
+        # Use physical proximity to establish initial synapses
+        src_c = torch.arange(self.active_limit, device=self.device)
+        src, tgt = self._sample_proximity_pairs(src_c, src_c, num_connections, sigma=2.0)
+        mask    = src != tgt
+        self.indices = torch.stack([src[mask], tgt[mask]])
 
         signs = torch.where(self.is_inhibitory_tensor[self.indices[0]], -1.0, 1.0)
         self.weights_values   = (torch.rand(self.indices.shape[1], device=self.device) * 0.09 + 0.01) * signs
         self.integrity_values = torch.ones(self.indices.shape[1], device=self.device)
+
+        # Dopamine eligibility trace per synapse
+        self.eligibility = torch.zeros(self.indices.shape[1], device=self.device)
+
+        # LIF Membrane potential and threshold parameters
+        self.v_mem = torch.zeros(num_nodes, device=self.device)
+        self.v_thresh = 1.0
+        self.v_reset = 0.0
+        self.v_leak = 0.8
 
         # STDP traces — DIFFERENT decay rates to implement temporal asymmetry
         # pre_trace  (for LTP): τ+ ≈ 20 ms → decay 0.85 at 10 Hz (narrower causal window)
@@ -100,6 +128,7 @@ class StructuralPlasticity:
         self._stp_x = torch.ones(n_syn,        device=self.device)  # vesicle fraction
 
         self._cached_sparse_weights = None
+        self._cached_sparse_weights_stp = None
         self._topology_changed      = True
 
         # Critical-period plasticity (Hensch 2005)
@@ -114,36 +143,45 @@ class StructuralPlasticity:
     # ------------------------------------------------------------------
 
     def apply_neural_dynamics(self, activity: torch.Tensor) -> torch.Tensor:
-        """Enforce refractory period and spike-frequency adaptation.
+        """Enforce refractory period, spike-frequency adaptation, and LIF integration.
 
-        Returns filtered activity where refractory neurons are silenced and
-        adapting neurons have reduced gain. Operates entirely on GPU.
+        Integrates incoming activation (current) into membrane potential v_mem,
+        generating a binary spike when threshold v_thresh is reached, and then
+        resetting membrane potential and applying refractory periods.
 
         Refractory: Hodgkin & Huxley 1952 — absolute refractory 2 ticks.
         Adaptation:  Bhattacharjee & Bhattacharjee 2005 — slow K⁺ activation.
+        LIF integration: leaky integrate-and-fire spike threshold.
         """
-        # --- Absolute refractory: silence any neuron still counting down ---
         refractory_mask = self._refractory > 0
-        activity = activity * (~refractory_mask).float()
 
-        # --- Spike-frequency adaptation: reduce gain by accumulated K⁺ current ---
-        # Adaptation factor in [0.3, 1.0]: heavy firing → lower gain
+        # Adaptation gates effective input current gain: heavy firing -> lower gain
         adaptation_gain = torch.clamp(1.0 - self._adaptation * 0.7, 0.3, 1.0)
-        activity = activity * adaptation_gain
+        input_current = activity * adaptation_gain * (~refractory_mask).float()
 
-        # --- Update refractory countdown ---
-        # Neurons that just fired enter refractory; others decrement toward 0
-        fired_now = activity > 0.5
-        self._refractory[fired_now]  = self._REFRACTORY_TICKS
+        # Integrate input current into membrane potential
+        self.v_mem += input_current
+
+        # Detect spikes
+        fired_now = self.v_mem >= self.v_thresh
+
+        # Reset membrane potential and trigger refractory for winners
+        self.v_mem[fired_now] = self.v_reset
+        self._refractory[fired_now] = self._REFRACTORY_TICKS
+
+        # Decrement refractory countdown for others
         self._refractory[~fired_now] = torch.clamp(
             self._refractory[~fired_now] - 1, min=0).to(torch.int16)
 
-        # --- Update adaptation variable (τ ≈ 100 ms → decay 0.90/tick at 10 Hz) ---
+        # Leak membrane potential for non-firing neurons
+        self.v_mem[~fired_now] *= self.v_leak
+
+        # Update adaptation (slow K⁺ current accumulation, τ ≈ 100 ms -> decay 0.90/tick)
         self._adaptation *= 0.90
         self._adaptation[fired_now] = torch.clamp(
             self._adaptation[fired_now] + 0.15, 0.0, 1.0)
 
-        return activity
+        return fired_now.float()
 
     # ------------------------------------------------------------------
     # Internal
@@ -152,19 +190,26 @@ class StructuralPlasticity:
     def _coalesce_state(self):
         # Coalesce all per-edge state together so duplicates get merged consistently
         combined = torch.stack([self.weights_values, self.integrity_values,
-                                self._stp_u, self._stp_x], dim=1)
+                                self._stp_u, self._stp_x, self.eligibility], dim=1)
         temp = torch.sparse_coo_tensor(
             self.indices, combined,
-            (self.num_nodes, self.num_nodes, 4)).coalesce()
+            (self.num_nodes, self.num_nodes, 5)).coalesce()
         self.indices          = temp.indices()
         v                     = temp.values()
         self.weights_values   = v[:, 0]
         self.integrity_values = torch.clamp(v[:, 1], 0.0, 2.0)
         self._stp_u           = torch.clamp(v[:, 2], 0.0, 1.0)
         self._stp_x           = torch.clamp(v[:, 3], 0.0, 1.0)
-        self._cached_sparse_weights = torch.sparse_coo_tensor(
-            self.indices, self.weights_values, (self.num_nodes, self.num_nodes))
+        self.eligibility      = v[:, 4]
+        coo = torch.sparse_coo_tensor(
+            torch.stack([self.indices[1], self.indices[0]]), self.weights_values, (self.num_nodes, self.num_nodes)).coalesce()
+        self._cached_sparse_weights = coo.to_sparse_csr()
         self._topology_changed = False
+
+        # Compute permutation mapping for transposed sparse matrix representation (sorted indices[1], indices[0])
+        # This handles the index swap sorting correct mapping when copying values back.
+        keys = self.indices[1] * self.num_nodes + self.indices[0]
+        self._transpose_perm = torch.argsort(keys)
 
     def get_sparse_weights(self, apply_stp: bool = False) -> torch.Tensor:
         """Return cached sparse weight matrix, optionally scaled by STP efficacy.
@@ -176,15 +221,24 @@ class StructuralPlasticity:
         if getattr(self, '_topology_changed', True) or self._cached_sparse_weights is None:
             self._coalesce_state()
         else:
-            self._cached_sparse_weights._values().copy_(self.weights_values)
+            self._cached_sparse_weights.values().copy_(self.weights_values[self._transpose_perm])
 
         if apply_stp:
             stp_efficacy = self._stp_u * self._stp_x   # release probability × resource
             eff_vals = self.weights_values * stp_efficacy
-            return torch.sparse_coo_tensor(
-                self.indices, eff_vals, (self.num_nodes, self.num_nodes))
+            if getattr(self, '_cached_sparse_weights_stp', None) is None or self._topology_changed:
+                coo_stp = torch.sparse_coo_tensor(
+                    torch.stack([self.indices[1], self.indices[0]]), eff_vals, (self.num_nodes, self.num_nodes)).coalesce()
+                self._cached_sparse_weights_stp = coo_stp.to_sparse_csr()
+            else:
+                self._cached_sparse_weights_stp.values().copy_(eff_vals[self._transpose_perm])
+            return self._cached_sparse_weights_stp
 
         return self._cached_sparse_weights
+
+    def get_stp_scaled_weights(self) -> torch.Tensor:
+        """Return raw flat weights scaled by current STP efficacy (release probability * resources)."""
+        return self.weights_values * self._stp_u * self._stp_x
 
     def step_stp(self, activity: torch.Tensor) -> None:
         """Advance short-term synaptic plasticity state for one tick.
@@ -214,6 +268,42 @@ class StructuralPlasticity:
     # Neurogenesis — van Praag 2002; Eriksson 1998
     # ------------------------------------------------------------------
 
+    def _sample_proximity_pairs(
+        self,
+        src_candidates: torch.Tensor,
+        tgt_candidates: torch.Tensor,
+        n_pairs:        int,
+        sigma:          float = 2.0
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if len(src_candidates) == 0 or len(tgt_candidates) == 0:
+            return (torch.empty(0, dtype=torch.long, device=self.device),
+                    torch.empty(0, dtype=torch.long, device=self.device))
+
+        if len(src_candidates) == 1:
+            src = src_candidates.expand(n_pairs)
+        else:
+            src_idxs = torch.randint(0, len(src_candidates), (n_pairs,), device=self.device)
+            src = src_candidates[src_idxs]
+
+        src_coords = self.coordinates[src]
+        perturbed = src_coords + torch.randn_like(src_coords) * sigma
+
+        if len(tgt_candidates) == 1:
+            tgt = tgt_candidates.expand(n_pairs)
+        else:
+            k_candidates = min(8, len(tgt_candidates))
+            tgt_pool_idxs = torch.randint(0, len(tgt_candidates), (n_pairs, k_candidates), device=self.device)
+            tgt_pool = tgt_candidates[tgt_pool_idxs]
+
+            tgt_coords = self.coordinates[tgt_pool]
+            diffs = tgt_coords - perturbed.unsqueeze(1)
+            dists = torch.sum(diffs ** 2, dim=-1)
+
+            min_idxs = torch.argmin(dists, dim=1)
+            tgt = tgt_pool[torch.arange(n_pairs, device=self.device), min_idxs]
+
+        return src, tgt
+
     def _wire_new_neurons(self, old_limit: int, new_limit: int):
         """Grow axons and dendrites for newly activated neurons.
 
@@ -226,15 +316,17 @@ class StructuralPlasticity:
         n_existing = old_limit
         n_new_syn  = max(1, int(new_count * n_existing * self._initial_density * 2))
 
-        new_nrn  = torch.randint(old_limit,  new_limit,  (n_new_syn,), device=self.device)
-        existing = torch.randint(0,          n_existing, (n_new_syn,), device=self.device)
+        # Wire new neurons using proximity
+        new_c = torch.arange(old_limit, new_limit, device=self.device)
+        existing_c = torch.arange(old_limit, device=self.device)
 
+        # Half incoming (existing -> new), half outgoing (new -> existing)
         half = n_new_syn // 2
-        # Incoming: existing → new (dendrite receives input)
-        # Outgoing: new → existing (axon sends output)
-        src = torch.cat([existing[:half], new_nrn[half:]])
-        tgt = torch.cat([new_nrn[:half],  existing[half:]])
-        # No autapses — cortex has no self-connections
+        src_incoming, tgt_incoming = self._sample_proximity_pairs(existing_c, new_c, half, sigma=2.0)
+        src_outgoing, tgt_outgoing = self._sample_proximity_pairs(new_c, existing_c, n_new_syn - half, sigma=2.0)
+
+        src = torch.cat([src_incoming, src_outgoing])
+        tgt = torch.cat([tgt_incoming, tgt_outgoing])
         no_self = src != tgt
         src, tgt = src[no_self], tgt[no_self]
         n_new_syn = src.shape[0]
@@ -246,6 +338,7 @@ class StructuralPlasticity:
         self.indices          = torch.cat([self.indices,          torch.stack([src, tgt])], dim=1)
         self.weights_values   = torch.cat([self.weights_values,   new_weights])
         self.integrity_values = torch.cat([self.integrity_values, new_integ])
+        self.eligibility      = torch.cat([self.eligibility,      torch.zeros(n_new_syn, device=self.device)])
         self._stp_u           = torch.cat([self._stp_u, torch.full((n_new_syn,), 0.3, device=self.device)])
         self._stp_x           = torch.cat([self._stp_x, torch.ones(n_new_syn,        device=self.device)])
         self._topology_changed = True
@@ -277,11 +370,15 @@ class StructuralPlasticity:
         current_activity:          torch.Tensor,
         neuromodulator_multiplier: float,
         acetylcholine:             float = 0.5,
+        dopamine:                  float = 0.5,
     ):
         # Critical-period scaling — younger brain learns faster (Hensch 2005)
         self._age_ticks += 1
         cp_scale = self.critical_period_factor
         neuromodulator_multiplier = neuromodulator_multiplier * cp_scale
+
+        # Decay eligibility trace (τ ≈ 5 ticks)
+        self.eligibility *= 0.8
 
         # Asymmetric trace decay: pre decays faster (narrower LTP window),
         # post decays slower (wider LTD window) — Bi & Poo 1998: τ- > τ+.
@@ -317,11 +414,9 @@ class StructuralPlasticity:
                          * post_act_mag
                          * neuromodulator_multiplier
                          * ach_boost)
-            self.weights_values[ltp_mask] = torch.clamp(
-                self.weights_values[ltp_mask] + delta_ltp * signs[ltp_mask],
-                -1.0, 1.0)
+            self.eligibility[ltp_mask] += delta_ltp * signs[ltp_mask]
             self.integrity_values[ltp_mask] = torch.clamp(
-                self.integrity_values[ltp_mask] + 0.1, 0.0, 2.0)
+                self.integrity_values[ltp_mask] + 0.1 * dopamine, 0.0, 2.0)
 
         # LTD: anti-causal (post fired before pre fires now)
         # Magnitude A- = 0.015  (< A+, asymmetry from Bi & Poo 1998)
@@ -330,9 +425,24 @@ class StructuralPlasticity:
             delta_ltd = (0.015
                          * self.post_trace[post_idx][ltd_mask]
                          * neuromodulator_multiplier)
-            self.weights_values[ltd_mask] = torch.clamp(
-                self.weights_values[ltd_mask] - delta_ltd * signs[ltd_mask],
-                -1.0, 1.0)
+            self.eligibility[ltd_mask] -= delta_ltd * signs[ltd_mask]
+
+        # Passive synaptic integrity decay (pruning of unused connections, τ ≈ 10000 ticks)
+        self.integrity_values = torch.clamp(self.integrity_values - 0.0001, min=0.0)
+
+        # Consolidate eligibility trace into weights, gated/modulated by dopamine
+        # High dopamine -> consolidate LTP/LTD; low dopamine -> suppress/reduce consolidation
+        new_weights = self.weights_values + self.eligibility * dopamine * 0.1
+
+        # Enforce Dale's Principle: prevent sign flipping (clamping)
+        # Inhibitory synapses (pre-synaptic is inhibitory) must stay in [-1.0, 0.0]
+        # Excitatory synapses (pre-synaptic is excitatory) must stay in [0.0, 1.0]
+        is_inh_syn = self.is_inhibitory_tensor[self.indices[0]]
+        self.weights_values = torch.where(
+            is_inh_syn,
+            torch.clamp(new_weights, -1.0, 0.0),
+            torch.clamp(new_weights, 0.0, 1.0)
+        )
 
         # NOW register spikes into traces — after LTP/LTD, so this tick's
         # activity only influences plasticity from the NEXT tick onward.
@@ -392,6 +502,7 @@ class StructuralPlasticity:
                 self.indices          = self.indices[:, alive_mask]
                 self.weights_values   = self.weights_values[alive_mask]
                 self.integrity_values = self.integrity_values[alive_mask]
+                self.eligibility      = self.eligibility[alive_mask]
                 self._stp_u           = self._stp_u[alive_mask]
                 self._stp_x           = self._stp_x[alive_mask]
                 self._topology_changed = True
@@ -401,8 +512,7 @@ class StructuralPlasticity:
             active_idx = torch.where(active_nodes[:self.active_limit] > 0.5)[0]
             if len(active_idx) > 1:
                 n_new = 20
-                src = active_idx[torch.randint(0, len(active_idx), (n_new,), device=self.device)]
-                tgt = active_idx[torch.randint(0, len(active_idx), (n_new,), device=self.device)]
+                src, tgt = self._sample_proximity_pairs(active_idx, active_idx, n_new, sigma=1.5)
                 no_self = src != tgt
                 src, tgt = src[no_self], tgt[no_self]
                 if src.shape[0] > 0:
@@ -413,6 +523,8 @@ class StructuralPlasticity:
                                                        torch.rand(k, device=self.device) * 0.1 * signs])
                     self.integrity_values = torch.cat([self.integrity_values,
                                                        torch.ones(k, device=self.device) * 0.5])
+                    self.eligibility      = torch.cat([self.eligibility,
+                                                       torch.zeros(k, device=self.device)])
                     self._stp_u           = torch.cat([self._stp_u,
                                                        torch.full((k,), 0.3, device=self.device)])
                     self._stp_x           = torch.cat([self._stp_x,

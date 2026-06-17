@@ -78,7 +78,7 @@ class VoiceID:
     @property
     def edge_tts_pitch(self) -> str:
         sign = '+' if self.pitch_shift >= 0 else ''
-        return f'{sign}{self.pitch_shift:.1f}Hz'
+        return f'{sign}{self.pitch_shift:.1f}st'
 
     @property
     def edge_tts_rate(self) -> str:

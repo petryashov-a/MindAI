@@ -47,7 +47,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from mindai.worlds.base import World
-from mindai.worlds.minecraft.retina import FovealRetina   # reused — works for any window
+from mindai.environment.retina import FovealRetina   # biologically accurate foveal vision
 from mindai.worlds.generic.input import GenericInputController
 
 

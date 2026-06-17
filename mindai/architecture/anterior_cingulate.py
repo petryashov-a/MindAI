@@ -87,7 +87,7 @@ class AnteriorCingulate:
         # Models the rapid post-error negativity (~100 ms latency)
         if chosen_action is not None and chosen_action < self.num_actions:
             expected_prob = float(self._prev_action_probs[chosen_action])
-            error_signal  = max(0.0, 1.0 - expected_prob / (p[chosen_action] + 1e-9))
+            error_signal  = max(0.0, expected_prob - p[chosen_action])
             self.ern = float(np.clip(0.7 * self.ern + 0.3 * error_signal, 0.0, 1.0))
         else:
             self.ern *= 0.8

@@ -24,6 +24,17 @@ Quick start::
 from mindai.brain import Brain
 from mindai.layout import SensoryLayout
 from mindai.feels import FeelingSystem, Feel, curves
+from mindai.architecture.language_cortex import LanguageCortex, WernickeModule, BrocaModule, SyntacticStack
+from mindai.engine.sdr_encoder import SDREncoder
+from mindai.engine.cross_modal_binder import CrossModalBinder
+from mindai.architecture.theory_of_mind import TheoryOfMind, DialogueBeliefState
+from mindai.architecture.prefrontal_cortex import DialogueWorkingMemory
 
-__all__ = ['Brain', 'SensoryLayout', 'FeelingSystem', 'Feel', 'curves']
-__version__ = '0.3.0'
+__all__ = [
+    'Brain', 'SensoryLayout', 'FeelingSystem', 'Feel', 'curves',
+    'LanguageCortex', 'WernickeModule', 'BrocaModule', 'SyntacticStack',
+    'SDREncoder', 'CrossModalBinder',
+    'TheoryOfMind', 'DialogueBeliefState',
+    'DialogueWorkingMemory',
+]
+__version__ = '0.5.0'

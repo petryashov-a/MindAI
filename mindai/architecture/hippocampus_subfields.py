@@ -95,6 +95,7 @@ class HippocampalSubfields:
         self._W_ca3_ca1 = (rng.random((ca3_size, ca1_size)) < 0.10).astype(np.float32) * 0.5
         # CA3 recurrent (auto-associative)
         self._W_ca3_rec = np.zeros((ca3_size, ca3_size), dtype=np.float32)
+        self._has_stored = False
 
         # CA3 stored patterns — for retrieval comparison
         self._stored_patterns: list[np.ndarray] = []
@@ -144,7 +145,7 @@ class HippocampalSubfields:
         # --- CA3: mossy fibre input + recurrent retrieval ---
         ca3_input = dg @ self._W_dg_ca3
         # Recurrent step (one pass, attractor approximation)
-        if self._W_ca3_rec.any():
+        if self._has_stored:
             ca3_input = ca3_input + ca3_input @ self._W_ca3_rec * 0.3
         ca3 = self._kwta(ca3_input, self.ca3_sparsity)
         self.last_ca3 = ca3
@@ -189,11 +190,11 @@ class HippocampalSubfields:
             return
         # Hebbian outer product on active units only — sparse update
         idx = np.where(active)[0]
-        for i in idx:
-            self._W_ca3_rec[i, idx] += ca3[idx] * 0.05
-            self._W_ca3_rec[i, i]    = 0.0   # no self-recurrence
+        self._W_ca3_rec[np.ix_(idx, idx)] += np.outer(ca3[idx], ca3[idx]) * 0.05
+        np.fill_diagonal(self._W_ca3_rec, 0.0)
         # Cap to prevent runaway
         np.clip(self._W_ca3_rec, -1.0, 1.0, out=self._W_ca3_rec)
+        self._has_stored = True
         self._stored_patterns.append(ca3.copy())
         self._episode_meta.append(episode)
         # Bound memory

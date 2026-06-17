@@ -369,19 +369,11 @@ class FovealRetina:
     # Public API
     # ------------------------------------------------------------------
 
-    def get_visual_array(self) -> np.ndarray:
-        """Capture, blur by eccentricity, sample non-uniformly.
-
-        Returns flat float32 array of shape (grid_h * grid_w * 5,):
-            [R₀ G₀ B₀ L₀ M₀ | R₁ G₁ B₁ L₁ M₁ | … ]
-        """
-        rgb_u8   = self._capture_rgb()
-        self._last_raw_rgb = rgb_u8          # cached for homeostasis probes
-        H, W     = rgb_u8.shape[:2]
-        rgb_f32  = rgb_u8.astype(np.float32) / 255.0
-
-        pyramid  = self._make_blur_pyramid(rgb_f32)
-        R, G, B  = self._sample_points(pyramid, H, W)
+    def preprocess_image(self, rgb_f32: np.ndarray) -> np.ndarray:
+        """Process an arbitrary float32 RGB image [0,1] through the retina pipeline."""
+        H, W = rgb_f32.shape[:2]
+        pyramid = self._make_blur_pyramid(rgb_f32)
+        R, G, B = self._sample_points(pyramid, H, W)
 
         luma   = (0.299 * R + 0.587 * G + 0.114 * B).astype(np.float32)
         motion = np.clip(np.abs(luma - self._prev_luma), 0.0, 1.0).astype(np.float32)
@@ -390,3 +382,14 @@ class FovealRetina:
         # Interleave: (R₀,G₀,B₀,L₀,M₀, R₁,…)
         out = np.stack([R, G, B, luma, motion], axis=1).reshape(-1)
         return out.astype(np.float32)
+
+    def get_visual_array(self) -> np.ndarray:
+        """Capture, blur by eccentricity, sample non-uniformly.
+
+        Returns flat float32 array of shape (grid_h * grid_w * 5,):
+            [R₀ G₀ B₀ L₀ M₀ | R₁ G₁ B₁ L₁ M₁ | … ]
+        """
+        rgb_u8   = self._capture_rgb()
+        self._last_raw_rgb = rgb_u8          # cached for homeostasis probes
+        rgb_f32  = rgb_u8.astype(np.float32) / 255.0
+        return self.preprocess_image(rgb_f32)

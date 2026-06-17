@@ -25,7 +25,7 @@ Biological basis:
   Output — central nucleus (CeA):
     → Hypothalamus: autonomic arousal (heart rate, adrenaline)
     → LC: noradrenaline surge
-    → VTA: dopamine suppression (aversive prediction error)
+    → VTA: dopamine modulation (both excitation for salience and indirect suppression via RMTg)
     → Striatum: avoidance bias
 
   Basolateral nucleus (BLA):
@@ -54,7 +54,8 @@ class Amygdala:
 
         # Lateral nucleus: CS → fear association weights
         # Initialised near zero — all fear must be learned (LeDoux 1996)
-        self.cs_weights = np.zeros(num_sensory, dtype=np.float32)
+        self.cs_weights_fast = np.zeros(num_sensory, dtype=np.float32)
+        self.cs_weights_slow = np.zeros(num_sensory, dtype=np.float32)
 
         # Current threat level output from central nucleus (CeA)
         self.threat_level: float = 0.0
@@ -85,11 +86,11 @@ class Amygdala:
         s = sensory_input[:self.num_sensory]
 
         # --- Fast path (1-tick latency thalamo-amygdalar) ---
-        fast_activation = float(np.dot(self._fast_buf, self.cs_weights))
+        fast_activation = float(np.dot(self._fast_buf, self.cs_weights_fast))
         self._fast_buf[:] = s   # store for next tick
 
         # --- Slow path (current tick, cortical CS representation) ---
-        slow_activation = float(np.dot(s, self.cs_weights))
+        slow_activation = float(np.dot(s, self.cs_weights_slow))
 
         # --- Unconditioned stimulus (US = pain) ---
         us_present = pain_signal > 0.3
@@ -99,16 +100,21 @@ class Amygdala:
             # Hebbian LTP: CS neurons co-active with US → strengthen weights
             # Only update for active sensory channels
             active = (s > 0.2).astype(np.float32)
-            delta = _LTP_RATE * active * pain_signal * (1.0 - self.cs_weights)
-            self.cs_weights = np.clip(self.cs_weights + delta, 0.0, 1.0)
+            delta_fast = _LTP_RATE * active * pain_signal * (1.0 - self.cs_weights_fast)
+            self.cs_weights_fast = np.clip(self.cs_weights_fast + delta_fast, 0.0, 1.0)
+            
+            delta_slow = _LTP_RATE * active * pain_signal * (1.0 - self.cs_weights_slow)
+            self.cs_weights_slow = np.clip(self.cs_weights_slow + delta_slow, 0.0, 1.0)
         else:
             self._no_us_ticks += 1
             # Extinction: vmPFC inhibits CeA when CS presented without US
             # Slow decay — extinction is fragile (Milad & Quirk 2002)
             if self._no_us_ticks > 50:
                 active = (s > 0.2).astype(np.float32)
-                self.cs_weights = np.clip(
-                    self.cs_weights - _EXTINCTION_RATE * active, 0.0, 1.0)
+                self.cs_weights_fast = np.clip(
+                    self.cs_weights_fast - _EXTINCTION_RATE * active, 0.0, 1.0)
+                self.cs_weights_slow = np.clip(
+                    self.cs_weights_slow - _EXTINCTION_RATE * active, 0.0, 1.0)
 
         # --- Central nucleus activation ---
         # Fast path provides the immediate threat signal; slow path refines
@@ -122,9 +128,9 @@ class Amygdala:
         fear_conditioned = (not us_present) and (raw_threat > 0.3)
 
         # --- BLA emotional tagging ---
-        # Hippocampal memories formed during high amygdala activation are
-        # consolidated preferentially (McGaugh 2000)
-        self.emotional_tag = float(np.clip(self.threat_level * 1.5, 0.0, 1.0))
+        # Hippocampal memories formed during high amygdala activation or reward (DA)
+        # are consolidated preferentially (McGaugh 2004; Hamann 2001)
+        self.emotional_tag = float(np.clip(self.threat_level * 1.5 + dopamine * 0.5, 0.0, 1.0))
 
         # --- DA suppression (aversive PE) ---
         # High threat + low dopamine = strong aversive signal

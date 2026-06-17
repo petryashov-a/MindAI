@@ -1,22 +1,20 @@
-"""Biological motion detector — MT+/V5 analog.
+"""Biological motion detector — pSTS analog.
 
 Biological basis (Oram & Perrett 1994; Grossman & Blake 2002):
-  Area MT+ (middle temporal cortex) responds selectively to biological motion —
-  coherent, hierarchically structured movement with an internal source.
-  Crucially, MT+ fires strongly even to point-light displays (Johansson 1973):
-  just the joint trajectories suffice. Random motion of the same speed does not
-  drive MT+ responses.
+  pSTS (posterior superior temporal sulcus) responds selectively to biological
+  motion (e.g. point-light displays of walking/jumping), receiving motion
+  signals from Area MT+/V5 (Gross & Blake 1999).
+  Crucially, pSTS fires strongly to coherent, hierarchically structured
+  movement with an internal source, whereas random motion or global uniform
+  motion (camera pan) is ignored.
 
-  Three hallmarks of biological motion that MT+ detects
-  (Troje 2002; Cutting & Kozlowski 1977):
+  Three hallmarks of biological motion that pSTS detects:
     1. Temporal autocorrelation: biological motion has smooth, predictable
-       trajectories (muscles can't make discontinuous jumps). Pure noise has
-       near-zero autocorrelation.
+       trajectories (muscles can't make discontinuous jumps). Pearson r correlation
+       between consecutive frames is high.
     2. Structured variance: different parts of the visual field move at
-       different rates simultaneously (limbs have phase offsets). Uniform
-       global motion (camera pan) has low structured variance.
-    3. Periodicity: walking, reaching, chopping — nearly all biological
-       actions have a periodic component in the 0.5–4 Hz range.
+       different rates simultaneously (limbs have phase offsets).
+    3. Periodicity: walking, reaching, chopping — periodic rhythms in the 0.5–4 Hz range.
 
 Implementation:
   We maintain a short history of the visual input (5 ticks ≈ 500 ms).
@@ -44,7 +42,7 @@ _BP_A    = 0.75       # IIR bandpass coefficient (≈ 1–4 Hz passband at 10 Hz
 
 
 class BiologicalMotionDetector:
-    """MT+/V5 analog: scores how 'biological' the current visual input looks."""
+    """pSTS analog: scores how 'biological' the current visual input looks."""
 
     def __init__(self, vision_size: int):
         self.vision_size = vision_size
@@ -74,11 +72,14 @@ class BiologicalMotionDetector:
         prev   = frames[-2]
 
         # --- Feature 1: temporal autocorrelation (Troje 2002) ---
-        # High r → smooth trajectory → biological
+        # High r → smooth trajectory → biological (Pearson r correlation)
         delta = curr - prev
+        mean_c = np.mean(curr)
+        mean_p = np.mean(prev)
         var_c = float(np.var(curr) + 1e-6)
         var_p = float(np.var(prev) + 1e-6)
-        autocorr = float(np.mean(curr * prev)) / (np.sqrt(var_c * var_p) + 1e-6)
+        cov = float(np.mean((curr - mean_c) * (prev - mean_p)))
+        autocorr = cov / (np.sqrt(var_c * var_p) + 1e-6)
         # Clamp to [0, 1]: negative means jerky/reversed, not biological
         autocorr_score = float(np.clip(autocorr, 0.0, 1.0))
 

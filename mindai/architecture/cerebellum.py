@@ -57,9 +57,10 @@ class Cerebellum:
         self.granule_size     = motor_size * _GRANULE_EXPANSION
 
         # Granule cell encoding matrix — random sparse projections (Marr 1969)
-        # ~5% connectivity, binary, fixed (not plastic)
+        # Biologically scaled connectivity to prevent dead cells in small networks
         rng = np.random.default_rng(42)
-        self._granule_w = (rng.random((self.granule_size, motor_size)) < 0.05).astype(np.float32)
+        sparsity = max(0.05, 3.0 / motor_size)
+        self._granule_w = (rng.random((self.granule_size, motor_size)) < sparsity).astype(np.float32)
 
         # Purkinje cell weights: granule → reafference prediction
         self._purkinje_w = np.zeros(
@@ -76,6 +77,9 @@ class Cerebellum:
 
         # DCN output: smoothed excitatory drive to thalamus
         self.dcn_output: float = 0.0
+
+        # Climbing fiber refractory period counter (Ito 1984)
+        self._cf_cooldown: int = 0
 
     def update(
         self,
@@ -105,9 +109,13 @@ class Cerebellum:
         self.prediction_error = float(0.8 * self.prediction_error + 0.2 * error_mag)
 
         # Climbing-fibre LTD / LTP
-        climbing_fire = error_mag > _CF_THRESHOLD
+        climbing_fire = (error_mag > _CF_THRESHOLD) and (self._cf_cooldown <= 0)
+        if self._cf_cooldown > 0:
+            self._cf_cooldown -= 1
+
         g = granule.astype(np.float32)
         if climbing_fire:
+            self._cf_cooldown = 5  # Refractory period: ~5 ticks (500ms at 10Hz)
             # LTD: reduce Purkinje weights for active granule cells
             delta = -_LTD_RATE * np.outer(error_vec, g)
             self._purkinje_w = np.clip(self._purkinje_w + delta, -1.0, 1.0)
@@ -125,8 +133,8 @@ class Cerebellum:
         # When error is large, DCN corrects the ongoing command
         correction = np.zeros(self.motor_size, dtype=np.float32)
         if climbing_fire:
-            # Project error back through granule weights to motor space
-            error_proj = (self._granule_w.T @ (g * error_mag)).astype(np.float32)
+            # Project error vector back through Purkinje weights and granule weights to motor space
+            error_proj = (self._granule_w.T @ ((self._purkinje_w.T @ error_vec) * g)).astype(np.float32)
             correction = np.clip(error_proj * 0.1, -0.3, 0.3)
 
         self._prev_motor[:] = mc

@@ -11,12 +11,10 @@ Data layout (auto-discovered from data/)
 
 Usage
     python main_agent.py                          # local GPU, stdin chat
-    python main_agent.py --gui                    # browser UI (recommended)
-    python main_agent.py --remote ws://IP:8000    # brain on remote GPU
-    python main_agent.py --download ws://IP:8000  # pull weights
-    python main_agent.py --data /other/path
+    python main_agent.py --data /other/path       # custom data directory
+    python main_agent.py --c4                     # stream from allenai/c4
 
-Save: savegame_brain/  (shared with main_minecraft.py)
+Save: savegame_brain/
 """
 
 import sys
@@ -28,7 +26,7 @@ from mindai.worlds.agent_world import AgentWorld
 from mindai.neurochemistry.neuromodulators import EndocrineSystem
 
 # ---------------------------------------------------------------------------
-# Brain configuration — must match main_minecraft.py for weight compatibility
+# Brain configuration
 # ---------------------------------------------------------------------------
 
 _SAVE_DIR           = 'savegame_brain'
@@ -46,7 +44,7 @@ _HUNGER_SIZE  = int(_NUM_NEURONS * 0.005)                   # ~10000 @ 2M  somat
 _PAIN_SIZE    = int(_NUM_NEURONS * 0.010)                   # ~20000 @ 2M  somatosensory
 _TOKEN_SIZE   = int(_NUM_NEURONS * 0.00819) * 2             # ~32760 @ 2M  cur+ctx
 
-_CURRICULUM   = (0.65, 0.30, 0.05)   # text / paired(images+video) / qa
+# Curriculum is strictly sequential/phase-based (see AgentWorld configuration)
 
 # ---------------------------------------------------------------------------
 
@@ -68,20 +66,17 @@ def _discover_data(data_dir: Path) -> dict:
 def _parse_args():
     args   = sys.argv[1:]
     data   = 'data'
-    remote = None
-    gui    = False
     c4     = False
+    rehab_ticks = 0
     i = 0
     while i < len(args):
         a = args[i]
-        if   a == '--data'     and i+1 < len(args): data   = args[i+1]; i += 2
-        elif a == '--remote'   and i+1 < len(args): remote = args[i+1]; i += 2
-        elif a == '--download' and i+1 < len(args): _download_weights(args[i+1]); sys.exit(0)
-        elif a == '--gui':                          gui    = True;       i += 1
-        elif a == '--c4':                           c4     = True;       i += 1
+        if   a == '--data' and i+1 < len(args): data = args[i+1]; i += 2
+        elif a == '--c4':                       c4   = True;       i += 1
+        elif a == '--rehab-ticks' and i+1 < len(args): rehab_ticks = int(args[i+1]); i += 2
         elif a in ('-h', '--help'): print(__doc__); sys.exit(0)
         else: i += 1
-    return Path(data), remote, gui, c4
+    return Path(data), c4, rehab_ticks
 
 
 def _c4_stream(min_len: int = 200):
@@ -101,9 +96,9 @@ def _c4_stream(min_len: int = 200):
 def _build_world(sources: dict, c4: bool = False):
     print('\n>>> Источники данных:')
     for k, v in sources.items():
-        print(f'    {k:<8} → {v}')
+        print(f'    {k:<8} -> {v}')
     if c4:
-        print(f'    {"c4":<8} → allenai/c4 (en, streaming, in-memory)')
+        print(f'    {"c4":<8} -> allenai/c4 (en, streaming, in-memory)')
     if not sources and not c4:
         print('    (нет данных — только интерактивный режим)')
     print()
@@ -117,12 +112,11 @@ def _build_world(sources: dict, c4: bool = False):
         vision_size  = _VISION_SIZE,
         audio_size   = _AUDIO_SIZE,
         interactive  = True,
-        curriculum   = _CURRICULUM,
         text_stream  = _c4_stream() if c4 else None,
     )
 
 
-def _build_brain(world):
+def _build_brain(world, rehab_ticks=0):
     sensory = {
         'vision': _VISION_SIZE,
         'audio':  _AUDIO_SIZE,
@@ -142,6 +136,7 @@ def _build_brain(world):
         save_path      = _SAVE_DIR,
         num_actions    = world.tokenizer.vocab_size,
         synapse_density= _SYNAPSE_DENSITY,
+        rehab_ticks    = rehab_ticks,
     )
     brain.attach(EndocrineSystem())
     brain._clock_energy_scale = _CLOCK_ENERGY_SCALE
@@ -153,28 +148,19 @@ def _build_brain(world):
 # ---------------------------------------------------------------------------
 
 def run():
-    data_dir, remote, gui, c4 = _parse_args()
+    data_dir, c4, rehab_ticks = _parse_args()
     sources = _discover_data(data_dir)
 
-    if gui:
-        # Hand off to the Web GUI (it builds its own brain + world)
-        from webgui.server import main as webgui_main
-        sys.argv = [sys.argv[0], '--data', str(data_dir),
-                    '--neurons', str(_NUM_NEURONS)]
-        webgui_main()
-        return
-
-    if remote:
-        _run_remote(sources, remote, c4)
-        return
-
     world = _build_world(sources, c4=c4)
-    brain = _build_brain(world)
+    brain = _build_brain(world, rehab_ticks=rehab_ticks)
 
     if Path(_SAVE_DIR + '/brain.json').exists():
         ans = input('Найден сохранённый мозг. Продолжить? (y/n): ').strip().lower()
         if ans == 'y':
             brain.load(_SAVE_DIR)
+            world._tick_counter[0] = brain.tick
+            world.world_tick = brain.tick
+            print(f'>>> Мозг успешно восстановлен на тике {brain.tick:,}. Продолжаем обучение.')
 
     tc           = world._tick_counter
     orig_execute = world.execute_action
@@ -189,116 +175,7 @@ def run():
 
     world.execute_action = _execute_with_log
     print('>>> Запуск. Ctrl+C для сохранения и выхода.\n')
-    brain.run(world, headless=True)
-
-
-# ---------------------------------------------------------------------------
-# Remote WebSocket run — brain on friend's GPU, world local
-# ---------------------------------------------------------------------------
-
-def _run_remote(sources: dict, server_url: str, c4: bool = False):
-    """Run with brain on a remote GPU server.
-
-    Architecture: this process owns the AgentWorld (mic, files, stdin); the
-    server runs the FULL brain.run() pipeline. We just answer the brain's
-    RPC calls over a single websocket using msgpack-numpy.
-    """
-    try:
-        import websocket    # websocket-client
-    except ImportError:
-        print('pip install websocket-client')
-        return
-    try:
-        from mindai.worlds.remote_world import serve_world
-    except ImportError as e:
-        print(f'>>> {e}')
-        print('pip install msgpack msgpack-numpy')
-        return
-
-    url = server_url.rstrip('/')
-    url = url.replace('http://', 'ws://').replace('https://', 'wss://')
-    if not url.startswith('ws'):
-        url = 'ws://' + url
-    if not url.endswith('/ws'):
-        url += '/ws'
-
-    print(f'\n>>> Remote WebSocket: {url}')
-    print('>>> Сервер исполняет ВЕСЬ brain.run() (PFC, BG, sleep, нейромодуляторы)')
-    print('>>> Локально остаётся мир: ретина / cochlea / stdin / файлы\n')
-
-    world = _build_world(sources, c4=c4)
-
-    ws = None
-    for attempt in range(10):
-        try:
-            ws = websocket.create_connection(url, timeout=10,
-                                             enable_multithread=True)
-            break
-        except Exception as e:
-            print(f'>>> Попытка {attempt+1}/10: {e}')
-            time.sleep(2)
-    if ws is None:
-        print('>>> Не удалось подключиться.')
-        return
-
-    print('>>> Соединение установлено. Ctrl+C — остановить и сохранить.\n')
-    try:
-        serve_world(ws, world)
-    except KeyboardInterrupt:
-        print('\n>>> Остановка — сервер сохранит мозг автоматически.')
-    finally:
-        try:
-            ws.close()
-        except Exception:
-            pass
-
-
-# ---------------------------------------------------------------------------
-# Download weights from server
-# ---------------------------------------------------------------------------
-
-def _download_weights(server_url: str):
-    try:
-        import requests, zipfile, io
-    except ImportError:
-        print('pip install requests')
-        return
-
-    base = server_url.rstrip('/').replace('ws://', 'http://').replace('wss://', 'https://')
-    if base.endswith('/ws'):
-        base = base[:-3]
-
-    print('>>> Сохраняем веса на сервере...')
-    try:
-        requests.post(f'{base}/save', timeout=30)
-    except Exception as e:
-        print(f'>>> Save error: {e}')
-
-    print(f'>>> Скачиваем savegame_brain.zip ...')
-    r = requests.get(f'{base}/weights/download', timeout=300, stream=True)
-    if r.status_code != 200:
-        print(f'>>> Ошибка {r.status_code}')
-        return
-
-    total = int(r.headers.get('content-length', 0))
-    buf   = io.BytesIO()
-    done  = 0
-    for chunk in r.iter_content(256 * 1024):
-        buf.write(chunk)
-        done += len(chunk)
-        if total:
-            pct = done / total * 100
-            print(f'\r    {done/1024/1024:.1f} / {total/1024/1024:.1f} MB  ({pct:.0f}%)',
-                  end='', flush=True)
-    print()
-
-    buf.seek(0)
-    out = Path(_SAVE_DIR)
-    out.mkdir(exist_ok=True)
-    with zipfile.ZipFile(buf) as zf:
-        zf.extractall(out)
-    print(f'>>> Готово — веса в {out}/')
-    print('>>> Запускай: python main_agent.py')
+    brain.run(world, headless=True, checkpoint_interval=50000)
 
 
 if __name__ == '__main__':

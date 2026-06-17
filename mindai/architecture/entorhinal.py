@@ -63,9 +63,9 @@ class EntorhinalGrid:
         rng = np.random.default_rng(rng_seed)
         self.cells_per_module = cells_per_module
         self.num_modules      = len(self._MODULE_SCALES)
-        # Per-cell phase offsets (random within hex lattice)
+        # Per-cell phase offsets (random phase within the module)
         self._phase_offsets = [
-            rng.random((cells_per_module, embed_dim)) * 2 * np.pi
+            rng.random(cells_per_module) * 2 * np.pi
             for _ in self._MODULE_SCALES
         ]
         # Three hex basis vectors (60° apart) for true hexagonal periodicity
@@ -98,7 +98,7 @@ class EntorhinalGrid:
         grid = np.zeros(self.cells_per_module, dtype=np.float32)
         for axis in self._hex_basis:
             grid += np.cos(2 * np.pi * np.dot(scaled, axis)
-                           + phase_offset[:, 0])
+                           + phase_offset)
         # Normalise: cosine sum range [-3, 3] → [0, 1]
         grid = (grid + 3.0) / 6.0
         return grid

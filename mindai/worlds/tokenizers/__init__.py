@@ -2,11 +2,12 @@
 
 Public API:
     Tokenizer            — abstract base
-    BPETokenizer         — tiktoken-backed (cl100k_base)
+    CharTokenizer        — Character-level tokenizer for Russian and English
     get_tokenizer(name)  — factory
 """
 
 from mindai.worlds.tokenizers.base import Tokenizer
-from mindai.worlds.tokenizers.bpe  import BPETokenizer, get_tokenizer
+from mindai.worlds.tokenizers.char import CharTokenizer, get_tokenizer
 
-__all__ = ['Tokenizer', 'BPETokenizer', 'get_tokenizer']
+__all__ = ['Tokenizer', 'CharTokenizer', 'get_tokenizer']
+

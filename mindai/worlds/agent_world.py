@@ -67,7 +67,7 @@ def _import_tokenizer(name: str = 'auto'):
 
 
 def _import_retina(vision_size: int):
-    from mindai.worlds.minecraft.retina import FovealRetina
+    from mindai.environment.retina import FovealRetina
     return FovealRetina(vision_size=vision_size)
 
 
@@ -331,11 +331,13 @@ _AUDIO_EXTS = {'.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aac'}
 class _AudioFileSource:
     """Streams all audio files from a file or folder through the biological Cochlea."""
 
-    def __init__(self, path: str, audio_size: int = 770, sr: int = 16000):
+    def __init__(self, path: str, audio_size: int = 770, sr: int = 16000, loop: bool = True):
         from mindai.environment.hearing_system import Cochlea
         self._cochlea = Cochlea(audio_size=audio_size, sample_rate=sr)
         self._lock    = threading.Lock()
         self._out     = np.zeros(audio_size, dtype=np.float32)
+        self._loop_enabled = loop
+        self.is_done = False
 
         p = Path(path)
         if p.is_dir():
@@ -345,6 +347,7 @@ class _AudioFileSource:
 
         if not self._files:
             print(f'>>> No audio files found in {path}')
+            self.is_done = True
             return
 
         print(f'>>> AgentWorld audio: {len(self._files)} file(s) in {path}')
@@ -361,15 +364,12 @@ class _AudioFileSource:
                 loader = lambda p: sf.read(str(p), always_2d=False)[0]
             except ImportError:
                 print('>>> pip install librosa  (audio disabled)')
+                self.is_done = True
                 return
 
         idx = 0
         while True:
             f = self._files[idx % len(self._files)]
-            idx += 1
-            if idx >= len(self._files):
-                random.shuffle(self._files)
-                idx = 0
             try:
                 y = loader(f)
                 for i in range(0, len(y), chunk):
@@ -383,6 +383,14 @@ class _AudioFileSource:
             except Exception as e:
                 print(f'>>> audio error ({f.name}): {e}')
                 time.sleep(1.0)
+            
+            idx += 1
+            if idx >= len(self._files):
+                if not self._loop_enabled:
+                    self.is_done = True
+                    break
+                random.shuffle(self._files)
+                idx = 0
 
     def get(self) -> np.ndarray:
         with self._lock:
@@ -421,7 +429,7 @@ class AgentWorld:
         audio_size:    int                     = 770,
         interactive:   bool                    = True,
         max_context:   int                     = 64,
-        curriculum:    tuple[float,float,float]= (0.70, 0.25, 0.05),
+        curriculum:    tuple[float,float,float] | None = None,
         tokenizer:     str                     = 'auto',
         text_stream                            = None,
         phase_ticks:   dict[str, int] | None   = None,
@@ -432,11 +440,7 @@ class AgentWorld:
         self._max_context = max_context
         self._interactive = interactive
 
-        # Curriculum weights → cumulative thresholds for random draw
-        r, p, q = curriculum
-        total = r + p + q
-        self._thresh_raw    = r / total
-        self._thresh_paired = (r + p) / total
+        # (curriculum weights parameter is ignored; training is strictly phase-based)
 
         # ---- tokenizer & patterns ----------------------------------------
         self._tokenizer = _import_tokenizer(tokenizer)
@@ -477,6 +481,7 @@ class AgentWorld:
         # ---- audio (must come before paired so cochlea is ready) -----------
         self._cochlea    = None
         self._audio_file = None
+        self._injected_audio = None
         self._prev_audio = np.zeros(audio_size, dtype=np.float32)
         if audio_source == 'mic':
             self._cochlea = _import_cochlea(audio_size)
@@ -517,25 +522,23 @@ class AgentWorld:
 
         # ---- curriculum phase machine ------------------------------------
         # Strict sequential phases — ONE source active at a time, no mixing.
-        # Order: c4 → text → images → video → audio → qa.
+        # Order: text → images → video → qa.
         # Each phase silences inputs that don't belong to it (token channel,
         # audio channel) so STDP never builds anti-bindings between modalities
         # that just happen to co-occur in wall-clock time.
         # Phases without data are skipped automatically.
         # Defaults assume 10 Hz; tweak via phase_ticks={'name': start_tick}.
         default_pt = {
-            'c4':     0,
-            'text':   30_000,
+            'text':   0,
             'images': 60_000,
             'video':  120_000,
-            'audio':  200_000,
-            'qa':     250_000,
+            'qa':     180_000,
         }
         self._phase_starts = dict(default_pt)
         if phase_ticks:
             self._phase_starts.update(phase_ticks)
         # Canonical ordering — used for both promotion and skipping
-        self._phase_order = ('c4', 'text', 'images', 'video', 'audio', 'qa')
+        self._phase_order = ('text', 'images', 'video', 'qa')
         # Initial phase: first available
         self._phase: str = self._first_available_phase()
         self._phase_announced: set[str] = set()
@@ -566,7 +569,7 @@ class AgentWorld:
         self._stream_printed: int  = 0      # chars already sent to stdout
 
         # ---- token stream state ------------------------------------------
-        self._input_queue:   list[int] = []
+        self._input_queue:   deque[int] = deque()
         self._context:       deque[int] = deque(maxlen=max_context)
         self._current_token: int       = 0
         self._next_token:    int       = 0
@@ -658,12 +661,9 @@ class AgentWorld:
 
     def _phase_has_data(self, phase: str) -> bool:
         """True if the data source for `phase` is actually configured."""
-        if phase == 'c4':     return self._text_stream is not None
-        if phase == 'text':   return bool(self._raw_lines)
+        if phase == 'text':   return (self._text_stream is not None or bool(self._raw_lines))
         if phase == 'images': return self._paired_images is not None
         if phase == 'video':  return self._paired_videos is not None
-        if phase == 'audio':  return (self._cochlea is not None
-                                      or self._audio_file is not None)
         if phase == 'qa':     return bool(self._qa_pairs)
         return False
 
@@ -689,7 +689,7 @@ class AgentWorld:
             if self._phase_has_data(nxt):
                 self._phase = nxt
         if self._phase not in self._phase_announced:
-            print(f'\n>>> [CURRICULUM] фаза → {self._phase} '
+            print(f'\n>>> [CURRICULUM] фаза -> {self._phase} '
                   f'на тике {t:,}\n')
             self._phase_announced.add(self._phase)
 
@@ -700,15 +700,14 @@ class AgentWorld:
         text   — corpus.txt only
         images — paired_images only (captions feed token channel)
         video  — paired_videos only (their own audio feeds audio channel)
-        audio  — audio stream only (no vision, no tokens)
         qa     — qa.txt only
 
         _load_next_token consults self._phase to decide which text source
         to pull from (c4 stream vs corpus paragraphs). Other channels are
         gated in get_sensory_retina.
         """
-        if self._phase in ('c4', 'text'):
-            self._mode = self._phase           # 'c4' or 'text'
+        if self._phase == 'text':
+            self._mode = 'text'
             return
 
         if self._phase == 'images':
@@ -723,11 +722,6 @@ class AgentWorld:
                 self._activate_paired(self._paired_videos, 'paired_video')
             else:
                 self._mode = 'silent'
-            return
-
-        if self._phase == 'audio':
-            # No vision, no tokens — just listen.
-            self._mode = 'audio'
             return
 
         if self._phase == 'qa':
@@ -780,28 +774,32 @@ class AgentWorld:
         if not media_active and not self._input_queue:
             self._pick_phase_source()
 
-        parts: list[np.ndarray] = []
+        res: dict[str, np.ndarray] = {}
 
         # Vision — fixation comes from brain's SC motor output, not a script
         if self._retina is not None:
             self._retina.fixation = self._eye_fixation
             try:
-                parts.append(self._retina.get_visual_array())
+                res['vision'] = self._retina.get_visual_array()
             except Exception:
-                parts.append(np.zeros(self._v_size, dtype=np.float32))
+                res['vision'] = np.zeros(self._v_size, dtype=np.float32)
 
-        # Audio — strict phase gating. The audio channel is only fed in
-        # the 'video' and 'audio' phases. During earlier phases (c4, text,
-        # images) any background source (mic, _AudioFileSource thread) is
-        # ignored so STDP cannot bind unrelated audio onto whatever else
-        # is active. The channel still exists in the sensory layout so we
-        # emit zeros to keep shapes consistent.
-        if self._cochlea is not None or self._audio_file is not None:
+        # Audio — strict phase gating with interactive bypass.
+        # Interactive bypass: allow audio when an injected video is playing,
+        # an injected frame is present (chat mode), or an injected audio file is active.
+        if self._cochlea is not None or self._audio_file is not None or getattr(self, '_injected_audio', None) is not None:
             zero_spec = np.zeros(self._a_size, dtype=np.float32)
-            if self._phase == 'video' and self._cochlea is not None:
-                spec = self._cochlea.get_auditory_nerve_signal()
-            elif self._phase == 'audio':
-                if self._audio_file is not None:
+            interactive_active = (
+                self._injected_video is not None or
+                self._injected_frame is not None or
+                getattr(self, '_injected_audio', None) is not None
+            )
+            if self._phase == 'video' or interactive_active:
+                if getattr(self, '_injected_audio', None) is not None:
+                    spec = self._injected_audio.get()
+                    if self._injected_audio.is_done:
+                        self._injected_audio = None
+                elif self._audio_file is not None:
                     spec = self._audio_file.get()
                 elif self._cochlea is not None:
                     spec = self._cochlea.get_auditory_nerve_signal()
@@ -809,7 +807,7 @@ class AgentWorld:
                     spec = zero_spec
             else:
                 spec = zero_spec
-            parts.append(np.concatenate([spec, self._prev_audio]).astype(np.float32))
+            res['audio'] = np.concatenate([spec, self._prev_audio]).astype(np.float32)
             self._prev_audio = spec.copy()
 
         # Token
@@ -817,13 +815,9 @@ class AgentWorld:
         ctx_pat = np.zeros(self._token_n, dtype=np.float32)
         if self._context:
             ctx_pat = self._patterns[self._context[-1] % len(self._patterns)] * 0.7
-        parts.append(np.concatenate([cur_pat, ctx_pat]))
+        res['token'] = np.concatenate([cur_pat, ctx_pat])
 
-        full = np.concatenate(parts).astype(np.float32) if parts else np.array([], dtype=np.float32)
-        out  = np.zeros(num_neurons, dtype=np.float32)
-        n    = min(len(full), num_neurons)
-        out[:n] = full[:n]
-        return out
+        return res
 
     def receive_motor_pattern(self, motor_signals: np.ndarray) -> None:
         n = min(len(motor_signals), self._token_n)
@@ -923,6 +917,7 @@ class AgentWorld:
         if source is None:
             self._injected_frame   = None
             self._injected_video   = None
+            self._injected_audio   = None
             self._inject_hold      = 0
             self._streaming        = False
             return
@@ -977,8 +972,8 @@ class AgentWorld:
         if not path.exists():
             print(f'>>> inject_audio: файл не найден {path}')
             return
-        # Reuse _AudioFileSource for one-shot playback
-        _AudioFileSource(str(path), audio_size=self._a_size)
+        # Store reference for one-shot playback
+        self._injected_audio = _AudioFileSource(str(path), audio_size=self._a_size, loop=False)
         print(f'>>> [Аудио] {path.name}')
 
     def _start_stream_thread(self) -> None:
@@ -1012,7 +1007,7 @@ class AgentWorld:
     def _load_next_token(self) -> None:
         if self._input_queue:
             self._current_token = self._next_token
-            self._next_token    = self._input_queue.pop(0)
+            self._next_token    = self._input_queue.popleft()
             return
         # Silence token channel whenever paired media is on screen with no
         # queued caption tokens, or during interactive injection / pending
@@ -1026,10 +1021,10 @@ class AgentWorld:
             self._current_token = self._next_token
             self._next_token    = 0
             return
-        # Outside the two text-streaming phases the token channel is silent.
+        # Outside the text-streaming phase the token channel is silent.
         # paired phases handle their own caption tokens through _input_queue;
-        # qa phase queues from qa_pairs; audio/silent phases emit nothing.
-        if self._phase not in ('c4', 'text'):
+        # qa phase queues from qa_pairs; silent phases emit nothing.
+        if self._phase != 'text':
             self._current_token = self._next_token
             self._next_token    = 0
             return
@@ -1044,15 +1039,15 @@ class AgentWorld:
         # Load next paragraph from the source dictated by current phase
         while True:
             line = None
-            if self._phase == 'c4' and self._text_stream is not None:
+            if self._text_stream is not None:
                 try:
                     line = next(self._text_stream)
                 except StopIteration:
                     self._text_stream = None
                 except Exception as e:
-                    print(f'>>> text_stream error: {e}; phase c4 exhausted')
+                    print(f'>>> text_stream error: {e}; stream exhausted')
                     self._text_stream = None
-            elif self._phase == 'text' and self._raw_lines:
+            elif self._raw_lines:
                 if self._raw_idx >= len(self._raw_lines):
                     self._raw_idx = 0
                     random.shuffle(self._raw_lines)

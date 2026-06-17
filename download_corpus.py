@@ -35,7 +35,7 @@ def main():
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f'>>> Streaming C4 ({args.lang}) → {out}')
+    print(f'>>> Streaming C4 ({args.lang}) -> {out}')
     print(f'>>> Target: {args.lines:,} lines  (Ctrl+C to stop early)\n')
 
     ds = load_dataset(
@@ -78,7 +78,7 @@ def main():
     print(f'>>> Skipped {skipped:,} empty rows')
     print(f'>>> File size: {out.stat().st_size / 1024 / 1024:.1f} MB')
     print(f'\n>>> Run training:')
-    print(f'>>>   python main_agent.py --text {out}')
+    print(f'>>>   python main_agent.py')
 
 
 if __name__ == '__main__':

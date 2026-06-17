@@ -2,9 +2,9 @@
 
 # MindAI
 
-### A biologically grounded computational model of an embodied nervous system
+### A spiking neural network that learns language through Hebbian plasticity
 
-*No gradient descent. No loss functions. No scripted behavior.*
+*No gradient descent. No loss functions. No backpropagation.*
 *Synapses, neuromodulators, and time.*
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square&logo=python)](https://python.org)
@@ -18,29 +18,28 @@
 
 ## What this project is
 
-MindAI is a real-time simulation of an embodied nervous system written from a single
-constraint: **every learning event, every behavior, and every internal state must
-correspond to an identifiable mechanism in the mammalian brain**, backed by
-peer-reviewed neuroscience.
+MindAI is a research project exploring whether an LLM-like language agent can
+emerge from biologically accurate neural mechanisms — without any form of
+gradient-based learning.
 
-It is not a deep learning model. `torch.set_grad_enabled(False)` is set at startup.
-There is no optimizer, no backpropagation, no loss function, and no global error
-signal anywhere in the codebase. Plasticity is local and Hebbian: synapses change
-because the neurons they connect fired in close temporal proximity (Hebb 1949;
-Bi & Poo 1998). Neuromodulators *gate* how much plasticity occurs, never *which
-direction* to update — there is no teacher.
+`torch.set_grad_enabled(False)` is set at startup. There is no optimizer, no
+backpropagation, no loss function, and no global error signal anywhere in the
+codebase. Plasticity is local and Hebbian: synapses change because the neurons
+they connect fired in close temporal proximity (Hebb 1949; Bi & Poo 1998).
+Neuromodulators *gate* how much plasticity occurs, never *which direction*
+to update — there is no teacher.
 
 The system is built around a recurrent sparse spiking network of 400 000 to
 1 500 000 neurons running on a single GPU. On top of that substrate, ~30 modules
 implement specific anatomical structures of the human brain (PFC, amygdala,
 hippocampal subfields DG/CA3/CA1, cerebellum, basal ganglia, periaqueductal gray,
-locus coeruleus, etc.). Each module is documented against a specific paper or
-finding it implements.
+locus coeruleus, etc.). Each module is documented against the peer-reviewed paper
+it implements.
 
-The current primary target — `main_agent.py` — uses this substrate as a
-**multimodal language analog**: text, images with captions, video with audio, and
-Q&A pairs are presented to the agent and learned through Hebbian binding between
-sensory channels. Memory lives in synaptic weights, not in a context window;
+The entry point — `main_agent.py` — uses this substrate as a **multimodal
+language analog**: text, images with captions, video with audio, and Q&A pairs
+are presented to the agent and learned through Hebbian binding between sensory
+channels. Memory lives in synaptic weights, not in a context window;
 conversation and training are the same loop.
 
 ---
@@ -63,10 +62,9 @@ Within computational neuroscience, the closest relatives are Nengo / Spaun
 (Eliasmith et al.), Blue Brain (Markram), Numenta HTM (Hawkins), and the spiking
 networks targeted by Intel Loihi and SpiNNaker. The contribution of MindAI is not
 the underlying paradigm — SNN + STDP is decades old — but the **scope of integration**:
-most published SNN models examine a single mechanism in isolation
-(e.g. STDP in primary visual cortex, or dopaminergic action selection in the
-basal ganglia). MindAI integrates ~30 such mechanisms in a single running
-process, sharing one synaptic substrate, on a clock.
+most published SNN models examine a single mechanism in isolation. MindAI integrates
+~30 such mechanisms in a single running process, sharing one synaptic substrate, on
+a clock.
 
 ---
 
@@ -74,7 +72,7 @@ process, sharing one synaptic substrate, on a clock.
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│  World — multimodal sensory stream (AgentWorld) or GridWorld   │
+│  AgentWorld — multimodal sensory stream + curriculum            │
 │  text · images+captions · video+audio · Q&A · interactive chat │
 └────────────┬───────────────────────────────────────────────────┘
              │
@@ -167,7 +165,9 @@ m(chemistry) = (DA · 1.5 + 5HT · 0.5) · (1 − cortisol) · (1 + endorphins)
 ```
 
 Turrigiano homeostatic scaling normalizes total incoming weight when neurons
-become overloaded (Turrigiano 2008).
+become overloaded (Turrigiano 2008). Additionally, Astrocytes track running average neural
+activity via a slow EMA: hyperactive neurons (>8% average firing) scale down incoming
+synapses by 0.999/tick, while underactive neurons (<1% average firing) scale up by 1.001/tick.
 
 ### Three-factor corticostriatal learning
 Action selection follows the canonical three-factor rule:
@@ -185,7 +185,7 @@ brake gated by anterior cingulate conflict monitoring (Botvinick et al. 2001).
 Two anatomically distinct neuron populations:
 
 - Prediction neurons (L5/6 analogue): `Ŷ = W_td · internal_state`
-- Error neurons (L2/3 analogue): `ε = relu(sensory − Ŷ)`
+- Error neurons (L2/3 analogue): `ε = sensory − Ŷ` (signed, bidirectional)
 
 Both populations are persistent across ticks, so other modules can read the
 current prediction state or surprise signal independently. Surprise drives
@@ -214,11 +214,6 @@ neurons → STDP-learned back-connections fire visual neurons that previously
 co-occurred with trees → priority elevates at tree locations → the eye saccades
 there. This is voluntary, language-directed gaze emerging from the substrate,
 not a Python control flow.
-
-### Volition — Libet delay + somatic markers
-Every motor decision passes through a 15-tick queue (`FreeWillEngine`); during
-that delay, the insula can veto the action if accumulated interoceptive valence
-predicts harm (Damasio 1994; Libet 1983).
 
 ### Continuous time
 Axonal delays are modeled per-synapse via a GPU ring buffer (Swadlow 1985).
@@ -283,12 +278,15 @@ mindai/
 ├── engine/
 │   ├── plasticity_core.py                STDP, STP, refractory, adaptation, lateral inhibition
 │   ├── temporal_windows.py               Theta-gamma temporal binding (Lisman & Jensen 2013)
-│   └── axonal_delays.py                  Per-synapse axonal delay queue (Swadlow 1985)
+│   ├── axonal_delays.py                  Per-synapse axonal delay queue (Swadlow 1985)
+│   ├── sdr_encoder.py                    Sparse Distributed Representation (SDR) token encoding
+│   └── cross_modal_binder.py             Hebbian cross-modal binding (Damasio 1989 convergence zones)
 │
 ├── architecture/
-│   ├── predictive_hierarchy.py           Rao & Ballard 1999
+│   ├── predictive_hierarchy.py           Rao & Ballard 1999 predictive coding
 │   ├── thalamocortical_core.py           Crick 1984
-│   ├── prefrontal_cortex.py              Wallis 2007
+│   ├── prefrontal_cortex.py              Wallis 2007 (has DialogueWorkingMemory)
+│   ├── language_cortex.py                Broca production + Wernicke comprehension (dorsal stream)
 │   ├── cortical_areas.py / cortical_layers.py  Zeki 1978; Elston 2003
 │   ├── hippocampus_buffer.py             Scoville & Milner 1957
 │   ├── hippocampus_subfields.py          DG/CA3/CA1 pattern separation (Marr 1971)
@@ -322,16 +320,14 @@ mindai/
 │   └── circadian_rhythm.py               Adenosine + melatonin (Borbély 1982)
 │
 ├── environment/
-│   └── hearing_system.py                 ERB cochlea (Glasberg & Moore 1990)
+│   ├── hearing_system.py                 ERB cochlea (Glasberg & Moore 1990)
+│   └── retina.py                         FovealRetina — non-uniform foveal vision (Curcio 1990)
 │
 ├── feels/                                FeelingSystem — Stevens 1957, Weber-Fechner
 ├── speech/                               Vocal apparatus + ear (faster-whisper)
-├── worlds/
-│   ├── agent_world.py                    Multimodal training + chat (primary)
-│   ├── minecraft/                        Minecraft connector + foveal retina
-│   └── tokenizers/                       tiktoken cl100k_base wrapper
-├── hardware/                             Neuromorphic backend (Lava / Loihi)
-└── consciousness/neural_complexity.py    LZ76 perturbational complexity (Casali 2013)
+└── worlds/
+    ├── agent_world.py                    Multimodal training + chat (primary)
+    └── tokenizers/                       tiktoken cl100k_base wrapper
 ```
 
 ---
@@ -343,26 +339,17 @@ git clone https://github.com/mellson19/mindai.git
 cd mindai
 python -m venv .venv
 .venv\Scripts\activate                     # Windows; on Linux/macOS: source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e .
 
-# Primary: multimodal agent (LLM analog)
+# Run the multimodal agent (LLM analog)
 python main_agent.py                       # stdin chat + training
-python main_agent.py --gui                 # browser UI with drag-drop and voice
-python main_agent.py --remote ws://IP      # offload brain to a GPU server
-python main_agent.py --download ws://IP    # pull trained weights from a server
-
-# Optional GPU server (Colab T4 / private)
-python server.py --ngrok                   # exposes /chat and /ws via tunnel
-# See colab_server.ipynb for a one-click Colab T4 deployment
-
-# Secondary entry points
-python main.py train                       # 2D GridWorld bootstrap (legacy)
-python main_minecraft.py                   # Minecraft world
+python main_agent.py --data /other/path    # custom data directory
+python main_agent.py --c4                  # stream from allenai/c4 (pip install datasets)
+python main_agent.py --rehab-ticks 5000     # run in Rehabilitation Mode for 5k ticks
 ```
 
-**Requirements:** Python 3.10+, PyTorch (CUDA strongly recommended for 1.5M neurons),
-NumPy, SciPy, tiktoken. Optional: FastAPI + edge-tts + faster-whisper for the
-Web GUI; `av` or `moviepy` for video; `pyngrok` for tunneling.
+**Requirements:** Python 3.10+, PyTorch (CUDA strongly recommended for ≥400k neurons),
+NumPy, SciPy. Optional: tiktoken (better BPE tokenizer), `av` or `moviepy` for video.
 
 ---
 
@@ -372,7 +359,7 @@ Web GUI; `av` or `moviepy` for video; `pyngrok` for tunneling.
 data/
 ├── corpus.txt                paragraph-separated text
 ├── qa.txt                    question / answer pairs (alternating lines)
-├── paired/                   images and videos with optional .txt captions
+├── images/                   images with optional .txt captions
 │   ├── chair.jpg
 │   ├── chair.txt             "I see a chair. This is a chair."
 │   ├── lecture.mp4
@@ -381,7 +368,8 @@ data/
 ```
 
 Curriculum weights (`main_agent.py:_CURRICULUM`): 65% text, 30% paired media,
-5% Q&A.
+5% Q&A. Phases advance sequentially by tick count; phases without data are
+skipped automatically.
 
 ---
 
@@ -389,12 +377,13 @@ Curriculum weights (`main_agent.py:_CURRICULUM`): 65% text, 30% paired media,
 
 ```
 savegame_brain/
-├── brain.json                tick, num_neurons, mood, metadata
-└── weights.npz               sparse synapse matrix (row, col, w, integrity)
+├── brain.json                Main metadata (tick, active_limit, mood, rehab_ticks_left)
+├── metadata.jsonl            Waking phase statistics log
+├── weights.npz               Connectome weights + astrocytes, language, pred values
+├── behavior.npz              Basal ganglia and Pavlovian behavior weights
+├── hippocampus.npz           Episodic patterns stored in CA3/CA1 subfields
+└── entorhinal.json           Learned semantic positions of conceptual spaces
 ```
-
-Brains migrate cleanly between worlds while retaining learned weights, provided
-`num_neurons` matches.
 
 ---
 
@@ -411,12 +400,11 @@ Brains migrate cleanly between worlds while retaining learned weights, provided
   over anatomically defined regions.
 - **Not biologically complete.** ~30 modules cover only a tiny fraction of what
   the brain does. Glial dynamics are simplified, glutamate / GABA are the only
-  two transmitter classes treated explicitly at the synapse level, axonal
-  delay realism is capped at 20 ticks, and several modules (counterfactual
-  engine, IIT-style Φ space) are deprecated or stubbed.
+  two transmitter classes treated explicitly at the synapse level, and axonal
+  delay realism is capped at 20 ticks.
 - **Not benchmarked against LLMs.** This is research into whether the right
   combination of biological mechanisms produces emergent cognition in a single
-  embodied system. It is not, and may never be, competitive with statistical
+  system. It is not, and may never be, competitive with statistical
   language models on standard NLP tasks. That is by design — different
   question, different tools.
 
@@ -424,16 +412,9 @@ Brains migrate cleanly between worlds while retaining learned weights, provided
 
 ## Known limitations (tracked, not hidden)
 
-- `PredictiveMicrocircuits` td/bu activations lack a clamp and can grow
-  unboundedly under sustained surprise.
 - STDP `pre_trace` and `post_trace` are both written to 1.0 within the same
   tick, partially erasing temporal ordering — to be replaced with a continuous
   decaying eligibility trace.
-- `GlobalWorkspace.history_buffer` uses `list.pop(0)` — O(n); should be a
-  `collections.deque(maxlen=N)`.
-- IIT-style Φ space (`qualia_space_iit.py`) and `counterfactual_engine.py` are
-  dead code, kept for reference; LZ76 complexity (`neural_complexity.py`) is
-  the operational consciousness metric.
 
 ---
 

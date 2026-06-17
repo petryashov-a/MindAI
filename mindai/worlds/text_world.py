@@ -25,6 +25,7 @@ from __future__ import annotations
 import random
 import re
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -86,7 +87,7 @@ class TextWorld:
         self._motor_pattern: np.ndarray = np.zeros(self.TOKEN_NEURONS, dtype=np.float32)
         self._fatigue:       float = 0.0
         self._alive:         bool  = True
-        self._context:       list[int] = []   # recent token ids
+        self._context:       deque[int] = deque(maxlen=max_context)   # recent token ids
         self._current_token: int   = 0
         self._next_token:    int   = 0
         self._surprise_accum: float = 0.0
@@ -104,12 +105,12 @@ class TextWorld:
             print('>>> TextWorld: встроенный seed-корпус')
 
         # Interactive I/O buffers
-        self._input_queue:  list[int] = []   # pending input tokens
+        self._input_queue:  deque[int] = deque()   # pending input tokens
         self._output_ids:   list[int] = []   # generated output token ids
         self._output_text:  str = ''
 
         # World sound / vocalization stubs (Brain.run() expects these)
-        self._sound_queue: list[np.ndarray] = []
+        self._sound_queue: deque[np.ndarray] = deque()
         self.last_agent_vocalization = np.zeros(self.TOKEN_NEURONS, dtype=np.float32)
         self.isolation_ticks = 0
         self.agent_pos   = [0, 0]
@@ -126,7 +127,7 @@ class TextWorld:
         """Advance one token from corpus or input queue."""
         if self._input_queue:
             self._current_token = self._next_token
-            self._next_token    = self._input_queue.pop(0)
+            self._next_token    = self._input_queue.popleft()
             return
 
         # Advance in corpus
@@ -166,17 +167,16 @@ class TextWorld:
             'thirst': 0.0,
         }
 
-    def get_sensory_retina(self, num_neurons: int) -> np.ndarray:
-        """Return current + context token patterns as flat array."""
-        out = np.zeros(self.TOKEN_NEURONS * 2, dtype=np.float32)
-        # Current token pattern
+    def get_sensory_retina(self, num_neurons: int) -> dict[str, np.ndarray]:
+        """Return current + context token patterns as dict."""
         cur_pat = self._patterns[self._current_token % len(self._patterns)]
-        out[:self.TOKEN_NEURONS] = cur_pat
-        # Previous token as context
+        ctx_pat = np.zeros(self.TOKEN_NEURONS, dtype=np.float32)
         if self._context:
-            prev_pat = self._patterns[self._context[-1] % len(self._patterns)]
-            out[self.TOKEN_NEURONS:] = prev_pat * 0.7
-        return out
+            ctx_pat = self._patterns[self._context[-1] % len(self._patterns)] * 0.7
+        return {
+            'token_in':  cur_pat,
+            'token_ctx': ctx_pat,
+        }
 
     def receive_motor_pattern(self, motor_signals: np.ndarray) -> None:
         """Receive raw motor neuron activity from brain.py each tick.
@@ -219,8 +219,6 @@ class TextWorld:
 
         # Advance corpus
         self._context.append(self._current_token)
-        if len(self._context) > self.max_context:
-            self._context.pop(0)
 
         actual_next = self._next_token
         correct = (predicted_token == actual_next)
@@ -267,7 +265,7 @@ class TextWorld:
 
     def pop_world_sound(self) -> np.ndarray:
         if self._sound_queue:
-            return self._sound_queue.pop(0)
+            return self._sound_queue.popleft()
         return np.zeros(32, dtype=np.float32)
 
     def add_sound(self, pos, sound: np.ndarray) -> None:

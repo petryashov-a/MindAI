@@ -22,8 +22,8 @@ import torch
 
 class PredictiveMicrocircuits:
 
-    def __init__(self, num_nodes: int, initial_density: float = 0.005):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    def __init__(self, num_nodes: int, initial_density: float = 0.005, device: torch.device | None = None):
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.num_nodes       = num_nodes
         num_connections      = int(num_nodes * num_nodes * initial_density)
 
@@ -38,13 +38,20 @@ class PredictiveMicrocircuits:
         self.td_indices, self.td_values = _build(num_connections)
         self.bu_indices, self.bu_values = _build(num_connections)
 
+        # Pre-compute CSR value permutation mappings to handle any internal PyTorch reordering during to_sparse_csr()
+        ids_td = torch.arange(self.td_values.shape[0], dtype=torch.float32, device=self.device)
+        coo_td_temp = torch.sparse_coo_tensor(self.td_indices, ids_td, (num_nodes, num_nodes)).coalesce()
+        self.td_perm = coo_td_temp.to_sparse_csr().values().long()
+
+        ids_bu = torch.arange(self.bu_values.shape[0], dtype=torch.float32, device=self.device)
+        coo_bu_temp = torch.sparse_coo_tensor(self.bu_indices, ids_bu, (num_nodes, num_nodes)).coalesce()
+        self.bu_perm = coo_bu_temp.to_sparse_csr().values().long()
+
         self.prediction_neurons  = torch.zeros(num_nodes, device=self.device)
         self.error_neurons       = torch.zeros(num_nodes, device=self.device)
 
         self._W_top: torch.Tensor | None = None
         self._W_bot: torch.Tensor | None = None
-        self._td_dirty = True
-        self._bu_dirty = True
 
     def process_inference_step(
         self,
@@ -56,13 +63,13 @@ class PredictiveMicrocircuits:
         # 1. Top-down prediction (rebuild sparse tensor only when weights changed)
         # ------------------------------------------------------------------
         dev = sensory_input.device
-        if self._td_dirty or self._W_top is None:
-            self._W_top = torch.sparse_coo_tensor(
+        if self._W_top is None:
+            coo = torch.sparse_coo_tensor(
                 self.td_indices, self.td_values,
                 (self.num_nodes, self.num_nodes)).coalesce().to(dev)
-            self._td_dirty = False
+            self._W_top = coo.to_sparse_csr()
         else:
-            self._W_top._values().copy_(self.td_values)
+            self._W_top.values().copy_(self.td_values[self.td_perm].to(dev))
         W_top = self._W_top
         self.prediction_neurons = torch.clamp(
             torch.sparse.mm(W_top, internal_state.unsqueeze(1)).squeeze(1),
@@ -75,20 +82,18 @@ class PredictiveMicrocircuits:
         # ------------------------------------------------------------------
         self.error_neurons = sensory_input - self.prediction_neurons   # signed [-1, 1]
 
-        error_pos = torch.clamp( self.error_neurons, 0.0, 1.0)
-        error_neg = torch.clamp(-self.error_neurons, 0.0, 1.0)
-        error_abs = error_pos + error_neg
+        error_abs = torch.abs(self.error_neurons)
 
         # ------------------------------------------------------------------
         # 3. Bottom-up drive: propagate signed error to update internal state
         # ------------------------------------------------------------------
-        if self._bu_dirty or self._W_bot is None:
-            self._W_bot = torch.sparse_coo_tensor(
+        if self._W_bot is None:
+            coo = torch.sparse_coo_tensor(
                 self.bu_indices, self.bu_values,
                 (self.num_nodes, self.num_nodes)).coalesce().to(dev)
-            self._bu_dirty = False
+            self._W_bot = coo.to_sparse_csr()
         else:
-            self._W_bot._values().copy_(self.bu_values)
+            self._W_bot.values().copy_(self.bu_values[self.bu_perm].to(dev))
         W_bot = self._W_bot
         bottom_up_drive = torch.sparse.mm(
             W_bot, self.error_neurons.unsqueeze(1)).squeeze(1)
@@ -111,22 +116,20 @@ class PredictiveMicrocircuits:
 
         # TD: prediction neurons (pre=internal state) → error nodes (post)
         active_state = internal_state > 0.1
-        td_active    = active_state[self.td_indices[0]] & (error_abs[self.td_indices[1]] > 0.05)
+        td_active    = active_state[self.td_indices[1]] & (error_abs[self.td_indices[0]] > 0.05)
         if td_active.any():
             self.td_values[td_active] = torch.clamp(
                 self.td_values[td_active]
-                + alpha * error_abs[self.td_indices[1]][td_active],
+                + alpha * error_abs[self.td_indices[0]][td_active],
                 0.0, 1.0)
-            self._td_dirty = True
 
         # BU: error source (pre) → error destination (post): propagate surprise upward
         bu_active = (error_abs[self.bu_indices[0]] > 0.05) & (error_abs[self.bu_indices[1]] > 0.05)
         if bu_active.any():
             self.bu_values[bu_active] = torch.clamp(
                 self.bu_values[bu_active]
-                + alpha * error_abs[self.bu_indices[0]][bu_active],
+                + alpha * error_abs[self.bu_indices[0]][bu_active] * error_abs[self.bu_indices[1]][bu_active],
                 0.0, 1.0)
-            self._bu_dirty = True
 
         # ------------------------------------------------------------------
         # 5. Normalised surprise (per active node, size-invariant)

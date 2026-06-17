@@ -18,7 +18,7 @@ waking vision — the brain cannot tell them apart.
 Usage
 -----
     from mindai.lifecycle.dream_injector import DreamInjector
-    from mindai.worlds.minecraft.retina import FovealRetina
+    from mindai.environment.retina import FovealRetina
 
     retina   = FovealRetina(vision_size=2880)
     injector = DreamInjector('videos/chop_wood.mp4', retina, fps=10)
@@ -96,7 +96,7 @@ class DreamInjector:
                 # Convert BGR → RGB float32
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
                 # Pass through FovealRetina sampling (same pipeline as waking vision)
-                vec = retina._sample_points(retina._make_blur_pyramid(rgb))
+                vec = retina.preprocess_image(rgb)
                 self._frames.append(vec)
             frame_idx += 1
 

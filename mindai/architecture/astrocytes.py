@@ -52,17 +52,21 @@ import torch
 
 
 class Astrocytes:
-    """Slow weight-stability layer atop fast STDP (Fusi cascade memory)."""
+    """Slow weight-stability layer (Fusi cascade memory) and Activity-Dependent Homeostatic Scaling."""
 
-    # τ ≈ 5000 ticks → α = 0.9998 per-tick EMA
+    # τ ≈ 5000 ticks → α = 0.9998 per-tick EMA for weights
     _SLOW_DECAY = 0.9998
     # Pull-back rate for inactive synapses — gentle, biological
     _STABILITY_PULL = 0.001
+
+    # τ ≈ 200 ticks → α = 0.995 per-tick EMA for neural activity
+    _ACT_DECAY = 0.995
 
     def __init__(self, device: torch.device | None = None):
         self.device         = device or torch.device(
             'cuda' if torch.cuda.is_available() else 'cpu')
         self._slow_weights: torch.Tensor | None = None
+        self._avg_activity: torch.Tensor | None = None
         self._initialized   = False
 
     def initialize(self, current_weights: torch.Tensor) -> None:
@@ -77,13 +81,31 @@ class Astrocytes:
         post_idx: torch.Tensor,
         activity: torch.Tensor,
     ) -> torch.Tensor:
-        """Apply astrocytic stabilisation. Returns updated weights tensor.
+        """Apply astrocytic stabilisation and activity-dependent homeostatic scaling.
 
-        Active synapses: untouched (fast STDP wins).
-        Inactive synapses: pulled toward their slow EMA — the stable
-        long-term value the astrocyte "remembers" for that connection.
+        Returns updated weights tensor.
         """
-        # Resize if topology grew (neurogenesis added synapses)
+        num_neurons = activity.shape[0]
+
+        # 1. Resize/Initialize average neural activity tracker if needed
+        if (self._avg_activity is None 
+                or self._avg_activity.shape[0] != num_neurons):
+            if self._avg_activity is None:
+                # Seed at a healthy 2% target activity
+                self._avg_activity = 0.02 * torch.ones(num_neurons, device=self.device)
+            else:
+                n_extra = num_neurons - self._avg_activity.shape[0]
+                if n_extra > 0:
+                    extra = 0.02 * torch.ones(n_extra, device=self.device)
+                    self._avg_activity = torch.cat([self._avg_activity, extra])
+                else:
+                    self._avg_activity = self._avg_activity[:num_neurons]
+
+        # Update average neural activity (slow EMA)
+        self._avg_activity = (self._avg_activity * self._ACT_DECAY
+                              + activity.detach() * (1.0 - self._ACT_DECAY))
+
+        # 2. Resize/Initialize slow weights EMA if needed
         if (self._slow_weights is None
                 or self._slow_weights.shape[0] != weights.shape[0]):
             n_extra = weights.shape[0] - (
@@ -102,26 +124,43 @@ class Astrocytes:
         self._slow_weights = (self._slow_weights * self._SLOW_DECAY
                               + weights.detach() * (1.0 - self._SLOW_DECAY))
 
+        # 3. Stability pull-back for inactive synapses (Fusi 2005)
         # Determine active synapses: either pre or post fired
         active_pre  = activity[pre_idx]  > 0.5
         active_post = activity[post_idx] > 0.5
         active_syn  = active_pre | active_post
 
-        # Pull inactive synapses toward slow EMA — preserves long-term memory
-        # without forbidding short-term STDP on active ones
         inactive = ~active_syn
         if inactive.any():
-            delta = (self._slow_weights[inactive] - weights[inactive]) * self._STABILITY_PULL
-            weights[inactive] = weights[inactive] + delta
+            weights[inactive] += (self._slow_weights[inactive] - weights[inactive]) * self._STABILITY_PULL
+
+        # 4. Activity-Dependent Homeostatic Scaling (Turrigiano 2008)
+        # Scale incoming weights based on post-synaptic neuron's average activity:
+        # Healthy target range is [1%, 8%]
+        scale = torch.ones_like(weights)
+        hyperactive = self._avg_activity > 0.08
+        underactive = self._avg_activity < 0.01
+
+        # Scale down incoming synapses for hyperactive post-synaptic neurons
+        scale[hyperactive[post_idx]] *= 0.999
+        # Scale up incoming synapses for underactive post-synaptic neurons
+        scale[underactive[post_idx]] *= 1.001
+
+        weights = torch.clamp(weights * scale, -1.0, 1.0)
 
         return weights
 
     def state_dict(self) -> dict:
-        return {'slow_weights': self._slow_weights.cpu().numpy()
-                                if self._slow_weights is not None else None}
+        return {
+            'slow_weights': self._slow_weights.cpu().numpy() if self._slow_weights is not None else None,
+            'avg_activity': self._avg_activity.cpu().numpy() if self._avg_activity is not None else None,
+        }
 
     def load_state_dict(self, state: dict) -> None:
         sw = state.get('slow_weights')
         if sw is not None:
             self._slow_weights = torch.tensor(sw, device=self.device)
             self._initialized  = True
+        avg_act = state.get('avg_activity')
+        if avg_act is not None:
+            self._avg_activity = torch.tensor(avg_act, device=self.device)
