@@ -401,6 +401,45 @@ class _AudioFileSource:
 # AgentWorld
 # ---------------------------------------------------------------------------
 
+_SEED_CORPUS = [
+    "The brain is a prediction machine.",
+    "Neurons that fire together wire together.",
+    "Learning emerges from experience.",
+    "The sky is blue and the grass is green.",
+    "Language is a sequence of symbols.",
+    "Intelligence is the ability to adapt.",
+    "Memory is stored in synaptic weights.",
+    "The quick brown fox jumps over the lazy dog.",
+    "Hello, how are you today?",
+    "I am learning to understand language.",
+    "What is the meaning of consciousness?",
+    "The sun rises in the east and sets in the west.",
+    "Numbers: one two three four five six seven eight nine ten.",
+    "Colors: red orange yellow green blue indigo violet.",
+    "Time passes and patterns emerge from repetition.",
+    "To be or not to be, that is the question.",
+    "The answer to life, the universe, and everything is forty two.",
+    "Water flows downhill following the path of least resistance.",
+    "Fire needs oxygen, fuel, and heat to burn.",
+    "Plants convert sunlight into energy through photosynthesis.",
+    "The heart pumps blood through the body.",
+    "The brain contains approximately eighty six billion neurons.",
+    "Synapses are the connections between neurons.",
+    "Sleep is essential for memory consolidation.",
+    "Dreams occur during REM sleep.",
+    "Dopamine is released when we experience rewards.",
+    "Fear is processed by the amygdala.",
+    "Language is primarily a left hemisphere function.",
+    "Vision is processed in the occipital lobe.",
+    "Movement is controlled by the motor cortex.",
+    "I think therefore I am.",
+    "Knowledge is power.",
+    "Practice makes perfect.",
+    "Every action has an equal and opposite reaction.",
+    "Energy cannot be created or destroyed only transformed.",
+]
+
+
 class AgentWorld:
     """Multimodal world with curriculum: raw text / paired / Q&A.
 
@@ -461,7 +500,6 @@ class AgentWorld:
                 self._raw_lines = [l.strip() for l in text.splitlines() if l.strip()]
             print(f'>>> AgentWorld raw: {len(self._raw_lines)} paragraphs')
         else:
-            from mindai.worlds.text_world import _SEED_CORPUS
             self._raw_lines = list(_SEED_CORPUS)
             print('>>> AgentWorld raw: seed corpus')
         self._raw_idx = 0
@@ -878,14 +916,6 @@ class AgentWorld:
     # -----------------------------------------------------------------------
     # Stubs
     # -----------------------------------------------------------------------
-
-    def process_human_input(self, keys: dict) -> None:
-        text = keys.get('text_input', '')
-        if text:
-            self.inject_prompt(text)
-
-    def get_distance_to_human(self) -> float:
-        return float('inf')
 
     def pop_world_sound(self) -> np.ndarray:
         if self._sound_queue:

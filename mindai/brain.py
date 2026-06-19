@@ -43,21 +43,15 @@ World state is saved separately by the user's world connector code.
 This allows the brain to be migrated to a different world while retaining
 learned synaptic structure — exactly as a biological brain retains memories
 when moved to a new environment.
-
-Backward compat: if save_path ends with ``.pkl``, the old pickle format
-is used for both load and save.
 """
 
 from __future__ import annotations
 
 import json
-import os
-import pickle
 import time
 from pathlib import Path
 
 import numpy as np
-import scipy.sparse as sp
 import torch
 
 from mindai.layout import SensoryLayout
@@ -164,8 +158,7 @@ class Brain:
     device:
         ``'auto'``, ``'cpu'``, or ``'cuda'``.
     save_path:
-        Path to save the brain.  Use a directory path (e.g. ``'savegame/'``)
-        for the new format, or a ``.pkl`` file for the legacy format.
+        Path to save the brain as a directory (e.g. ``'savegame/'``).
     num_actions:
         Number of distinct motor actions (fed to BasalGanglia).
     """
@@ -418,29 +411,20 @@ class Brain:
     # Persistence — directory format (brain separate from world)
     # -------------------------------------------------------------------------
 
-    def _is_legacy_path(self, path: str) -> bool:
-        return str(path).endswith('.pkl')
-
     def load(self, path: str | None = None) -> bool:
-        """Load brain weights.
+        """Load brain weights from the directory save format.
 
-        Supports both the new directory format and the legacy ``.pkl`` format.
         Returns True on success.
         """
         p = path or self.save_path
-        if self._is_legacy_path(p):
-            return self._load_pkl(p)
         return self._load_dir(p)
 
     def save(self, path: str | None = None, world = None) -> None:
         """Save brain weights (brain state only — world state not included)."""
         p = path or self.save_path
-        if self._is_legacy_path(p):
-            self._save_pkl(p)
-        else:
-            self._save_dir(p, world)
+        self._save_dir(p, world)
 
-    # --- new directory format -------------------------------------------------
+    # --- directory save format -------------------------------------------------
 
     def _save_dir(self, save_dir: str, world = None) -> None:
         d = Path(save_dir)
@@ -722,50 +706,141 @@ class Brain:
             print(f'>>> Error loading brain: {e}')
             return False
 
-    # --- legacy pickle format (backward compat) --------------------------------
+    def _setup_runtime_io(self, headless: bool, layout):
+        from mindai.environment.hearing_system import Cochlea
 
-    def _save_pkl(self, path: str) -> None:
-        try:
-            idx = self._plasticity.indices.cpu().numpy()
-            w   = self._plasticity.weights_values.cpu().numpy()
-            ig  = self._plasticity.integrity_values.cpu().numpy()
-            n   = self.num_neurons
-            state = {
-                'tick':          self.tick,
-                'weights':       sp.coo_matrix((w,  (idx[0], idx[1])), shape=(n, n)),
-                'integrity':     sp.coo_matrix((ig, (idx[0], idx[1])), shape=(n, n)),
-                'active_limit':  self._plasticity.active_limit,
-                'is_inhibitory': self._plasticity.is_inhibitory,
-            }
-            with open(path, 'wb') as f:
-                pickle.dump(state, f)
-            print(f'>>> Brain saved to {path}')
-        except Exception as e:
-            print(f'>>> Error saving brain: {e}')
+        if headless:
+            return None
+        return Cochlea(num_bands=layout.size('audio'))
 
-    def _load_pkl(self, path: str) -> bool:
-        if not os.path.exists(path):
-            return False
-        try:
-            with open(path, 'rb') as f:
-                state = pickle.load(f)
-            w = state['weights'].tocoo()
-            i = state['integrity'].tocoo()
-            dev = self._device
-            self._plasticity.indices = torch.tensor(
-                np.vstack((w.row, w.col)), dtype=torch.long, device=dev)
-            self._plasticity.weights_values = torch.tensor(
-                w.data, dtype=torch.float32, device=dev)
-            self._plasticity.integrity_values = torch.tensor(
-                i.data, dtype=torch.float32, device=dev)
-            self._plasticity.active_limit  = state.get('active_limit',  self._plasticity.active_limit)
-            self._plasticity.is_inhibitory = state.get('is_inhibitory', self._plasticity.is_inhibitory)
-            self.tick = state.get('tick', 0)
-            print(f'>>> Brain loaded from {path} (tick {self.tick})')
-            return True
-        except Exception as e:
-            print(f'>>> Error loading brain: {e}')
-            return False
+    def _shutdown_runtime(self, ear, world, sp_path: str) -> None:
+        if ear is not None and hasattr(ear, 'stream') and ear.stream is not None:
+            ear.stream.stop()
+        if world.is_alive():
+            self.save(sp_path, world=world)
+
+    def _prepare_awake_inputs(
+        self,
+        world,
+        layout,
+        chem,
+        ear,
+        raw_buffer,
+        sl_vision,
+        sl_pain,
+        sl_hunger,
+        sl_audio,
+        sl_voc,
+        sz_audio,
+    ) -> dict:
+        world_signals = world.get_homeostatic_signals()
+
+        if self._feelings is not None:
+            self._feelings.update(world_signals)
+            self.wellbeing = self._feelings.wellbeing()
+        else:
+            self.wellbeing = 1.0 - float(np.mean(list(world_signals.values()) or [0.0]))
+
+        h_ratio = 1.0 - world_signals.get('hunger', 0.0)
+        w_ratio = 1.0 - world_signals.get('thirst', 0.0)
+        self._last_h_ratio = h_ratio
+        self._last_w_ratio = w_ratio
+
+        raw_pain_for_chem = world_signals.get('pain', 0.0)
+        if self._feelings is not None and 'pain' in self._feelings:
+            raw_pain_for_chem = self._feelings['pain'].raw
+        p_sig = chem.effective_pain_signal
+
+        raw = raw_buffer
+        raw[:] = 0.0
+
+        retina_data = world.get_sensory_retina(self.num_neurons)
+        if isinstance(retina_data, dict):
+            for channel, data in retina_data.items():
+                if layout.has(channel):
+                    slice_dest = layout.slice(channel)
+                    slice_len = layout.size(channel)
+                    raw[slice_dest] = np.pad(data, (0, max(0, slice_len - len(data))))[:slice_len]
+        else:
+            raw[:len(retina_data)] = retina_data
+
+        vis_data = raw[sl_vision] if sl_vision is not None else np.zeros(0)
+        bio_motion_score = self._motion_detector.update(vis_data)
+
+        pfc_goal = self._pfc.formulate_goal(
+            energy=h_ratio,
+            water=w_ratio,
+            base_resource=1.0,
+        )
+        raw += pfc_goal * 0.3
+
+        if self._feelings is not None:
+            if 'pain' in self._feelings and sl_pain is not None:
+                raw[sl_pain] = max(p_sig, self._feelings['pain'].sensation)
+            for feel in self._feelings:
+                if feel.channel == 'pain':
+                    continue
+                if feel.channel == 'hunger':
+                    sig = max(feel.sensation, chem.effective_hunger_signal)
+                    if sl_hunger is not None:
+                        raw[sl_hunger] = min(1.0, sig)
+                elif layout.has(feel.channel):
+                    raw[layout.slice(feel.channel)] = feel.sensation
+        else:
+            for channel, deficit in world_signals.items():
+                if channel == 'pain' and sl_pain is not None:
+                    raw[sl_pain] = max(p_sig, float(deficit))
+                elif layout.has(channel):
+                    raw[layout.slice(channel)] = float(np.clip(deficit, 0, 1))
+
+        if ear is not None:
+            mic_audio = ear.get_auditory_nerve_signal()
+        else:
+            mic_audio = np.zeros(sz_audio, dtype=np.float32)
+
+        if sl_audio is not None:
+            def _fit(x, n):
+                return np.pad(x, (0, max(0, n - len(x))))[:n]
+
+            world_sound = _fit(world.pop_world_sound(), sz_audio)
+            echo_read_idx = (self._voc_echo_idx + 1) % 3
+            vocal_echo = _fit(self._voc_echo_buf[echo_read_idx] * 0.4, sz_audio)
+            voc = world.last_agent_vocalization if sl_voc is not None else np.zeros(0)
+            voc_part = _fit(voc, sz_audio) if len(voc) else 0
+            raw[sl_audio] = _fit(mic_audio, sz_audio) + world_sound + vocal_echo + voc_part
+
+        dmn_replay = getattr(self, '_dmn_replay_prev', None)
+        if dmn_replay is not None and len(dmn_replay):
+            n = min(len(dmn_replay), len(raw))
+            raw[:n] += dmn_replay[:n] * 0.15
+
+        insula_out = self._insula.update(
+            pain=world_signals.get('pain', 0.0),
+            hunger=world_signals.get('hunger', 0.0),
+            thirst=world_signals.get('thirst', 0.0),
+            arousal=float(np.mean(raw)),
+        )
+
+        amyg_out = self._amygdala.update(raw, raw_pain_for_chem, chem.dopamine)
+        if self._chemistry is not None:
+            threat_na = amyg_out['threat_level'] * (1.0 - chem.serotonin * 0.5)
+            self._chemistry.noradrenaline = float(np.clip(
+                chem.noradrenaline + threat_na * 0.05, 0.1, 1.0))
+            self._chemistry.dopamine = float(np.clip(
+                chem.dopamine - amyg_out['da_suppression'] * 0.02, 0.1, 1.0))
+
+        return {
+            'world_signals': world_signals,
+            'h_ratio': h_ratio,
+            'w_ratio': w_ratio,
+            'raw_pain_for_chem': raw_pain_for_chem,
+            'p_sig': p_sig,
+            'raw': raw,
+            'mic_audio': mic_audio,
+            'bio_motion_score': bio_motion_score,
+            'insula_out': insula_out,
+            'amyg_out': amyg_out,
+        }
 
     # -------------------------------------------------------------------------
     # Main loop
@@ -784,7 +859,7 @@ class Brain:
         Parameters
         ----------
         world:
-            Any :class:`~mindai.worlds.World` implementation.
+            World/environment object supplying the AgentWorld-compatible IO hooks.
         headless:
             Skip PyGame rendering and microphone input.
         save_path:
@@ -794,31 +869,12 @@ class Brain:
         checkpoint_interval:
             Save the brain every N ticks (None = no periodic saves).
         """
-        from mindai.environment.hearing_system import Cochlea
-
         sp_path = save_path or self.save_path
         layout  = self._layout
 
-        # Resolve chemistry — use null-object if not attached
         chem = self._chemistry if self._chemistry is not None else _NULL_CHEM
+        ear = self._setup_runtime_io(headless, layout)
 
-        if not headless:
-            try:
-                from mindai.environment.ui_renderer import GameUI
-                import pygame
-                ui  = GameUI(world_size=getattr(world, 'size', 40))
-            except ImportError:
-                ui  = None
-            ear = Cochlea(num_bands=layout.size('audio'))
-        else:
-            ui  = None
-            ear = None
-
-        speeds      = [1.0, 0.2, 0.1, 0.04, 0.016, 0.0]
-        speed_names = ['1 FPS', '5 FPS', '10 FPS', '25 FPS', '60 FPS', 'MAX']
-        speed_idx   = 4
-
-        prev_human_pos = list(getattr(world, 'human_pos', [0, 0]))
         if layout.has('vocalization'):
             world.last_agent_vocalization = np.zeros(layout.size('vocalization'))
         if not hasattr(world, 'isolation_ticks'):
@@ -842,22 +898,8 @@ class Brain:
                 self.tick += 1
                 if max_ticks and self.tick > max_ticks:
                     break
-                # --- input & speed -------------------------------------------
-                keys_pressed = {}
-                quit_sim     = False
-                if ui is not None:
-                    keys_pressed, quit_sim, speed_change = ui.handle_events()
-                    if speed_change == 1:
-                        speed_idx = min(5, speed_idx + 1)
-                    if speed_change == -1:
-                        speed_idx = max(0, speed_idx - 1)
-                if quit_sim or keys_pressed.get('q', False):
-                    break
 
-                # === SLEEP PATH ===============================================
                 if self._sleep.is_sleeping:
-                    world.process_human_input(keys_pressed)
-
                     # Spawn background sleep consolidation thread if not already running
                     if getattr(self, '_sleep_thread', None) is None or not self._sleep_thread.is_alive():
                         import threading
@@ -873,171 +915,29 @@ class Brain:
 
                 # === AWAKE PATH ===============================================
                 else:
-                    # ----------------------------------------------------------
-                    # 1. World signals → feelings → sensory injection
-                    # ----------------------------------------------------------
-                    world_signals = world.get_homeostatic_signals()
-
-                    if self._feelings is not None:
-                        # FeelingSystem applies psychophysical curves
-                        self._feelings.update(world_signals)
-                        self.wellbeing = self._feelings.wellbeing()
-                        dominant = self._feelings.dominant()
-                    else:
-                        # No FeelingSystem: pass raw signals through as-is
-                        self.wellbeing = 1.0 - float(np.mean(list(world_signals.values()) or [0.0]))
-                        dominant = None
-
-                    # Derive h_ratio / w_ratio for neuromodulation
-                    h_ratio = 1.0 - world_signals.get('hunger', 0.0)
-                    w_ratio = 1.0 - world_signals.get('thirst', 0.0)
-                    # Cache for PFC use during lucid dreams
-                    self._last_h_ratio = h_ratio
-                    self._last_w_ratio = w_ratio
-
-                    # Pain for substance_p wind-up (use raw nociceptive signal,
-                    # not the sensitised one, to prevent runaway feedback)
-                    raw_pain_for_chem = world_signals.get('pain', 0.0)
-                    if self._feelings is not None and 'pain' in self._feelings:
-                        raw_pain_for_chem = self._feelings['pain'].raw
-                    # p_sig: sensitised signal from previous tick (substance_p)
-                    p_sig = chem.effective_pain_signal
-
-                    # ----------------------------------------------------------
-                    # 2. Assemble sensory array
-                    # ----------------------------------------------------------
-                    # Reuse pre-allocated buffer — avoids np.zeros() every tick
-                    raw = _raw_np
-                    raw[:] = 0.0
-
-                    # Vision / sensory channels from world
-                    retina_data = world.get_sensory_retina(self.num_neurons)
-                    if isinstance(retina_data, dict):
-                        for channel, data in retina_data.items():
-                            if layout.has(channel):
-                                slice_dest = layout.slice(channel)
-                                slice_len = layout.size(channel)
-                                raw[slice_dest] = np.pad(data, (0, max(0, slice_len - len(data))))[:slice_len]
-                    else:
-                        raw[:len(retina_data)] = retina_data
-
-                    # Biological motion detection — MT+/V5 (Grossman & Blake 2002)
-                    # Score in [0,1]: how much the visual input looks like biological
-                    # motion (smooth trajectories + structured variance + periodicity).
-                    # Used below to gate mirror-neuron STDP.
-                    _vis_data = raw[_sl_vision] if _sl_vision is not None else np.zeros(0)
-                    _bio_motion_score = self._motion_detector.update(_vis_data)
-
-                    # PFC goal vector — vlPFC/OFC homeostatic bias (Wallis 2007)
-                    # formulate_goal() returns a sparse vector with 1.0 at goal neurons;
-                    # scaled by goal_persistence so it fades when deficit is resolved.
-                    pfc_goal = self._pfc.formulate_goal(
-                        energy=h_ratio,
-                        water=w_ratio,
-                        base_resource=1.0,
+                    awake = self._prepare_awake_inputs(
+                        world=world,
+                        layout=layout,
+                        chem=chem,
+                        ear=ear,
+                        raw_buffer=_raw_np,
+                        sl_vision=_sl_vision,
+                        sl_pain=_sl_pain,
+                        sl_hunger=_sl_hunger,
+                        sl_audio=_sl_audio,
+                        sl_voc=_sl_voc,
+                        sz_audio=_sz_audio,
                     )
-                    raw += pfc_goal * 0.3   # gentle bias, not override
-
-                    # Feelings → sensory channels (cached slices, no dict lookup)
-                    if self._feelings is not None:
-                        if 'pain' in self._feelings and _sl_pain is not None:
-                            raw[_sl_pain] = max(p_sig, self._feelings['pain'].sensation)
-                        for feel in self._feelings:
-                            if feel.channel == 'pain':
-                                continue
-                            if feel.channel == 'hunger':
-                                sig = max(feel.sensation, chem.effective_hunger_signal)
-                                if _sl_hunger is not None:
-                                    raw[_sl_hunger] = min(1.0, sig)
-                            elif layout.has(feel.channel):
-                                raw[layout.slice(feel.channel)] = feel.sensation
-                    else:
-                        for channel, deficit in world_signals.items():
-                            if channel == 'pain' and _sl_pain is not None:
-                                raw[_sl_pain] = max(p_sig, float(deficit))
-                            elif layout.has(channel):
-                                raw[layout.slice(channel)] = float(np.clip(deficit, 0, 1))
-
-                    # Audio (cached size)
-                    if ear is not None:
-                        ear.is_listening = keys_pressed.get('v', False)
-                        mic_audio = ear.get_auditory_nerve_signal()
-                    else:
-                        mic_audio = np.zeros(_sz_audio, dtype=np.float32)
-                    if _sl_audio is not None:
-                        # Pad/truncate every component to _sz_audio so they sum cleanly
-                        def _fit(x, n):
-                            return np.pad(x, (0, max(0, n - len(x))))[:n]
-                        world_sound = _fit(world.pop_world_sound(), _sz_audio)
-
-                        # Phonological loop echo (Baddeley 1986):
-                        # 2-tick delay between vocal motor and auditory echo
-                        # creates a valid STDP window for vocal→auditory learning.
-                        _echo_read_idx = (self._voc_echo_idx + 1) % 3
-                        vocal_echo = _fit(self._voc_echo_buf[_echo_read_idx] * 0.4, _sz_audio)
-
-                        voc = world.last_agent_vocalization if _sl_voc is not None else np.zeros(0)
-                        voc_part = _fit(voc, _sz_audio) if len(voc) else 0
-                        raw[_sl_audio] = _fit(mic_audio, _sz_audio) + world_sound + vocal_echo + voc_part
-
-                    # Social / human input processing
-                    #
-                    # Mirror neurons and oxytocin are NOT scripted here.
-                    # Both emerge entirely from STDP:
-                    #
-                    #   Mirror neurons (Rizzolatti 1996):
-                    #     The visual cortex processes whatever is on screen.
-                    #     When the AI watches a human chop a tree, V1→MT→STS
-                    #     encodes the motion pattern. Over repeated observation
-                    #     co-occurring with the AI's own motor output, STDP
-                    #     strengthens the visual→motor path. The 'mirror_neurons'
-                    #     layout slot marks neurons at the V→M intersection —
-                    #     no special activation code needed.
-                    #
-                    #   Oxytocin (Insel 1992):
-                    #     Innate triggers are touch and smell — absent here.
-                    #     Visual oxytocin requires learned association.
-                    #     It emerges after the brain pairs "human visual pattern"
-                    #     with social reward via STDP. No distance proxy injected.
-                    #
-                    # GridWorld human interaction (keyboard-driven world only):
-                    world.process_human_input(keys_pressed)
-                    prev_human_pos = list(getattr(world, 'human_pos', prev_human_pos))
-                    human_interacted = keys_pressed.get('e', False)
-                    if human_interacted:
-                        chem.trigger_social_bonding()
-                    if human_interacted and self.tick % 3 == 0:
-                        if hasattr(world, 'human_interact'):
-                            world.human_interact()
-
-                    # DMN autobiographical replay — injected before GPU transfer
-                    # (DMN.update() called after act_cpu; use previous tick's pattern here)
-                    _dmn_replay = getattr(self, '_dmn_replay_prev', None)
-                    if _dmn_replay is not None and len(_dmn_replay):
-                        n = min(len(_dmn_replay), len(raw))
-                        raw[:n] += _dmn_replay[:n] * 0.15
-
-                    # Insula — interoception + body-state valence (Craig 2002)
-                    insula_out = self._insula.update(
-                        pain=world_signals.get('pain', 0.0),
-                        hunger=world_signals.get('hunger', 0.0),
-                        thirst=world_signals.get('thirst', 0.0),
-                        arousal=float(np.mean(raw)),
-                    )
-
-                    # Amygdala — dual-path fear conditioning (LeDoux 1996).
-                    # Runs on CPU sensory array before GPU transfer.
-                    amyg_out = self._amygdala.update(
-                        raw, raw_pain_for_chem, chem.dopamine)
-                    if self._chemistry is not None:
-                        # CeA → LC: threat boosts noradrenaline.
-                        # 5-HT from dorsal raphe suppresses CeA fear output (Gross & Canteras 2012).
-                        _threat_na = amyg_out['threat_level'] * (1.0 - chem.serotonin * 0.5)
-                        self._chemistry.noradrenaline = float(np.clip(
-                            chem.noradrenaline + _threat_na * 0.05, 0.1, 1.0))
-                        # DA suppression (aversive prediction error)
-                        self._chemistry.dopamine = float(np.clip(
-                            chem.dopamine - amyg_out['da_suppression'] * 0.02, 0.1, 1.0))
+                    world_signals = awake['world_signals']
+                    h_ratio = awake['h_ratio']
+                    w_ratio = awake['w_ratio']
+                    raw_pain_for_chem = awake['raw_pain_for_chem']
+                    p_sig = awake['p_sig']
+                    raw = awake['raw']
+                    mic_audio = awake['mic_audio']
+                    _bio_motion_score = awake['bio_motion_score']
+                    insula_out = awake['insula_out']
+                    amyg_out = awake['amyg_out']
 
                     # ----------------------------------------------------------
                     # 3. Neural computation
@@ -1187,14 +1087,6 @@ class Brain:
                     )
                     self._is_daydreaming = dmn_out['activation'] > 0.4
                     self._dmn_replay_prev = dmn_out['replay_pattern']
-
-                    # Theory of Mind — only relevant when there is a social agent
-                    if hasattr(world, 'human_pos'):
-                        self._tom.update(
-                            distance=world.get_distance_to_human(),
-                            human_interacted=human_interacted,
-                            threat_signal=self._amygdala.threat_level,
-                        )
 
                     # LanguageCortex + CrossModalBinder + dlPFC WorkingMemory
                     # Runs every tick so the system continuously processes the
@@ -1433,9 +1325,9 @@ class Brain:
                     # 5. World interaction
                     # ----------------------------------------------------------
                     results = {'energy': 0.0, 'water': 0.0, 'stress': 0.0}
-                    # If world can receive raw motor pattern (e.g. TextWorld),
-                    # pass it before execute_action so it can decode via
-                    # nearest-neighbour pattern matching rather than BG action index.
+                    # If the world can receive the raw motor pattern, pass it
+                    # through before execute_action so it can decode its own
+                    # motor representation rather than only a BG action index.
                     if hasattr(world, 'receive_motor_pattern'):
                         world.receive_motor_pattern(motor_signals)
 
@@ -1473,7 +1365,6 @@ class Brain:
                     # gate during this and next ticks (Bandler & Shipley 1994)
                     self._pag.update(
                         threat=self._amygdala.threat_level,
-                        distance_to_threat=world.get_distance_to_human(),
                         dopamine=chem.dopamine,
                     )
                     # vlPAG opioid analgesia during freeze
@@ -1494,7 +1385,6 @@ class Brain:
                             auditory_spikes=mic_audio,
                             energy_gained=max(0.0, results.get('energy', 0.0)),
                             isolation_ticks=getattr(world, 'isolation_ticks', 0),
-                            distance_to_human=world.get_distance_to_human(),
                         )
                         self.mood = chem.derive_mood()
                         # Mood → plasticity modulation (Castrén 2005; Bhagya 2017)
@@ -1622,53 +1512,10 @@ class Brain:
                         print(f'\n>>> [CHECKPOINT] Auto-saving at tick {self.tick:,}...')
                         self.save(sp_path, world=world)
 
-                # === RENDER ==================================================
-                if ui is not None and self.tick % 2 == 0:
-                    feels_dict = self._feelings.as_dict() if self._feelings else {}
-                    stats = {
-                        'tick':        self.tick,
-                        'wellbeing':   self.wellbeing,
-                        'feels':       feels_dict,
-                        'nodes':       self._plasticity.active_limit,
-                        'vfe':         self.surprise,
-                        'mood':        ('ГРЁЗЫ (DMN)'
-                                        if getattr(self, '_is_daydreaming', False)
-                                        else self.mood)
-                                       if not self._sleep.is_sleeping else self.mood,
-                        'phi':         self._workspace.calculate_integration_metric(self._activity),
-                        'speed_name':  speed_names[speed_idx],
-                        'qualia':      qualia_shape,
-                        'agency':      self._ego.sense_of_agency,
-                        # Hormones (0.0 if no EndocrineSystem attached)
-                        'cortisol':      getattr(chem, 'cortisol',      0.0),
-                        'oxytocin':      getattr(chem, 'oxytocin',      0.0),
-                        'adrenaline':    getattr(chem, 'adrenaline',    0.0),
-                        'endorphins':    getattr(chem, 'endorphins',    0.0),
-                        'boredom':       getattr(chem, 'boredom',       0.0),
-                        'acetylcholine': getattr(chem, 'acetylcholine', 0.5),
-                        'anandamide':    getattr(chem, 'anandamide',    0.0),
-                        'substance_p':   getattr(chem, 'substance_p',   0.0),
-                        'ghrelin':       getattr(chem, 'ghrelin',       0.0),
-                        'leptin':        getattr(chem, 'leptin',        0.5),
-                        'vasopressin':   getattr(chem, 'vasopressin',   0.0),
-                        'prolactin':     getattr(chem, 'prolactin',     0.0),
-                        'insulin':       getattr(chem, 'insulin',       0.0),
-                    }
-                    ui.render(world, stats)
-
-                if ui is not None and speeds[speed_idx] > 0.0:
-                    time.sleep(speeds[speed_idx])
-
         except KeyboardInterrupt:
             print('\n>>> Emergency interruption.')
         finally:
-            if not headless:
-                import pygame
-                pygame.quit()
-            if ear is not None and hasattr(ear, 'stream') and ear.stream is not None:
-                ear.stream.stop()
-            if world.is_alive():
-                self.save(sp_path, world=world)
+            self._shutdown_runtime(ear, world, sp_path)
 
     # -------------------------------------------------------------------------
     # Helpers
@@ -1772,12 +1619,8 @@ class Brain:
 
     def _delete_save(self, path: str) -> None:
         """Delete brain save (called on death — world save is not deleted)."""
-        if self._is_legacy_path(path):
-            if os.path.exists(path):
-                os.remove(path)
-        else:
-            d = Path(path)
-            for name in ('brain.json', 'weights.npz', 'hippocampus.npz', 'entorhinal.json', 'metadata.jsonl', 'behavior.npz'):
-                f = d / name
-                if f.exists():
-                    f.unlink()
+        d = Path(path)
+        for name in ('brain.json', 'weights.npz', 'hippocampus.npz', 'entorhinal.json', 'metadata.jsonl', 'behavior.npz'):
+            f = d / name
+            if f.exists():
+                f.unlink()
