@@ -346,7 +346,7 @@ mindai/
 ## Installation and running
 
 ```bash
-git clone https://github.com/mellson19/mindai.git
+git clone https://github.com/petryashov-a/mindai.git
 cd mindai
 python -m venv .venv
 .venv\Scripts\activate                     # Windows; on Linux/macOS: source .venv/bin/activate
