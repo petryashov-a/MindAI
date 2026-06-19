@@ -189,7 +189,7 @@ class Brain:
                 if needed_gb <= free_gb:
                     self._device = torch.device('cuda')
                 else:
-                    print(f'>>> VRAM {free_gb:.1f} GB < нужно {needed_gb:.1f} GB -> CPU')
+                    print(f'>>> VRAM {free_gb:.1f} GB < needed {needed_gb:.1f} GB -> CPU')
                     self._device = torch.device('cpu')
             else:
                 self._device = torch.device('cpu')
@@ -199,7 +199,7 @@ class Brain:
         self.save_path = save_path
         self._rehab_ticks_left = rehab_ticks
         if rehab_ticks > 0:
-            print(f'>>> [РЕАБИЛИТАЦИЯ] Активирован режим реабилитации на {rehab_ticks} тиков.')
+            print(f'>>> [REHAB] Rehabilitating mode activated for {rehab_ticks} ticks.')
 
         self._layout = SensoryLayout.from_channels(
             vision_size=int(sensory_layout.get('vision', 0)),
@@ -210,7 +210,7 @@ class Brain:
 
         torch.set_grad_enabled(False)
         self.num_neurons = num_neurons
-        print(f'>>> Инициализация разума: {num_neurons} нейронов на {self._device}')
+        print(f'>>> Mind initialized with {num_neurons} neurons on {self._device}')
 
         # Core neural substrate — always present
         self._geometry      = BrainGeometry(num_neurons)
@@ -565,9 +565,9 @@ class Brain:
                 behavior_state['sound_to_fear'] = self._chemistry.sound_to_fear_weights
             np.savez_compressed(str(d / 'behavior.npz'), **behavior_state)
 
-            print(f'>>> Мозг сохранён в {d}/')
+            print(f'>>> Brain saved to {d}/')
         except Exception as e:
-            print(f'>>> Ошибка сохранения мозга: {e}')
+            print(f'>>> Error saving brain: {e}')
 
     def _load_dir(self, save_dir: str) -> bool:
         d = Path(save_dir)
@@ -716,10 +716,10 @@ class Brain:
                     self._chemistry.sound_to_dopamine_weights = bd['sound_to_dopamine']
                 if 'sound_to_fear' in bd and self._chemistry is not None and hasattr(self._chemistry, 'sound_to_fear_weights'):
                     self._chemistry.sound_to_fear_weights = bd['sound_to_fear']
-            print(f'>>> Мозг загружен из {d}/ (тик {self.tick})')
+            print(f'>>> Brain loaded from {d}/ (tick {self.tick})')
             return True
         except Exception as e:
-            print(f'>>> Ошибка загрузки мозга: {e}')
+            print(f'>>> Error loading brain: {e}')
             return False
 
     # --- legacy pickle format (backward compat) --------------------------------
@@ -739,9 +739,9 @@ class Brain:
             }
             with open(path, 'wb') as f:
                 pickle.dump(state, f)
-            print(f'>>> Мозг сохранён в {path}')
+            print(f'>>> Brain saved to {path}')
         except Exception as e:
-            print(f'>>> Ошибка сохранения: {e}')
+            print(f'>>> Error saving brain: {e}')
 
     def _load_pkl(self, path: str) -> bool:
         if not os.path.exists(path):
@@ -761,10 +761,10 @@ class Brain:
             self._plasticity.active_limit  = state.get('active_limit',  self._plasticity.active_limit)
             self._plasticity.is_inhibitory = state.get('is_inhibitory', self._plasticity.is_inhibitory)
             self.tick = state.get('tick', 0)
-            print(f'>>> Мозг загружен из {path} (тик {self.tick})')
+            print(f'>>> Brain loaded from {path} (tick {self.tick})')
             return True
         except Exception as e:
-            print(f'>>> Ошибка загрузки: {e}')
+            print(f'>>> Error loading brain: {e}')
             return False
 
     # -------------------------------------------------------------------------
@@ -836,7 +836,7 @@ class Brain:
         # Reusable numpy sensory array — avoids np.zeros() allocation every tick
         _raw_np = np.zeros(self.num_neurons, dtype=np.float32)
 
-        print('>>> ЗАПУСК AGI...')
+        print('>>> Starting AGI...')
         try:
             while True:
                 self.tick += 1
@@ -1515,7 +1515,7 @@ class Brain:
                     # 7. Death check
                     # ----------------------------------------------------------
                     if not world.is_alive():
-                        print('\n>>> СМЕРТЬ ОРГАНИЗМА.')
+                        print('\n>>> Organism death.')
                         self._delete_save(sp_path)
                         break
 
@@ -1530,7 +1530,7 @@ class Brain:
                         chem.dopamine = max(1.0, chem.dopamine)
                         chem.dopamine_mesocortical = max(1.0, chem.dopamine_mesocortical)
                         if self.tick % 50 == 0:
-                            print(f'>>> [РЕАБИЛИТАЦИЯ] Оставшееся время реабилитации: {self._rehab_ticks_left} тиков.')
+                            print(f'>>> [REHAB] Remaining rehabilitation time: {self._rehab_ticks_left} ticks.')
 
                     pain_suppression = max(0.0, 1.0 - raw_pain_for_chem)
                     # Mood gate: depression suppresses LTP rate (Castrén 2005)
@@ -1619,7 +1619,7 @@ class Brain:
 
                     # Periodic checkpoint check
                     if checkpoint_interval is not None and self.tick % checkpoint_interval == 0 and self.tick > 0:
-                        print(f'\n>>> [CHECKPOINT] Автосохранение на тике {self.tick:,}...')
+                        print(f'\n>>> [CHECKPOINT] Auto-saving at tick {self.tick:,}...')
                         self.save(sp_path, world=world)
 
                 # === RENDER ==================================================
@@ -1660,7 +1660,7 @@ class Brain:
                     time.sleep(speeds[speed_idx])
 
         except KeyboardInterrupt:
-            print('\n>>> Экстренное прерывание.')
+            print('\n>>> Emergency interruption.')
         finally:
             if not headless:
                 import pygame
@@ -1715,9 +1715,9 @@ class Brain:
             # Lucid dream: dlPFC re-engages during REM (LaBerge 1985; Voss 2009)
             if sleep_result.is_lucid:
                 if not getattr(self, '_was_lucid', False):
-                    print(f'\n    [ОСОЗНАННЫЙ СОН] Тик {self.tick} — '
-                          f'dlPFC реактивирована в REM. '
-                          f'Мониторинг={self._pfc_monitoring_strength:.3f}')
+                    print(f'\n    [LUCID DREAM] Tick {self.tick} — '
+                          f'dlPFC reactivated in REM. '
+                          f'Monitoring={self._pfc_monitoring_strength:.3f}')
                     self._was_lucid = True
                 # PFC goal biases dream activity
                 pfc_goal = self._pfc.formulate_goal(
@@ -1743,15 +1743,15 @@ class Brain:
 
             # Phase label in mood field (visible in UI stats)
             _phase_labels = {
-                SleepPhase.N1:  'СОН N1 (засыпание)',
-                SleepPhase.N2:  'СОН N2 (веретёна)',
-                SleepPhase.N3:  'СОН N3 (SWS/дельта)',
-                SleepPhase.REM: 'REM: СНОВИДЕНИЕ',
+                SleepPhase.N1:  'Sleep N1 ( onset)',
+                SleepPhase.N2:  'Sleep N2 (spindle)',
+                SleepPhase.N3:  'Sleep N3 (SWS/delta)',
+                SleepPhase.REM: 'REM: DREAM',
             }
             if sleep_result.current_phase in _phase_labels:
                 if (sleep_result.current_phase == SleepPhase.REM
                         and sleep_result.is_lucid):
-                    self.mood = 'REM: ОСОЗНАННЫЙ СОН ✦'
+                    self.mood = 'REM: LUCID DREAM ✦'
                 else:
                     self.mood = _phase_labels[sleep_result.current_phase]
 
@@ -1764,7 +1764,7 @@ class Brain:
                     self._chemistry.acetylcholine = 0.5
                     self._chemistry.noradrenaline = 0.1
                     self._chemistry.serotonin     = 0.5
-                print(f'\n>>> ПРОБУЖДЕНИЕ ОРГАНИЗМА (Тик {self.tick}).')
+                print(f'\n>>> ORGANISM WAKING UP (Tick {self.tick}).')
 
             self.tick += 1
             # Control pacing to keep CPU usage reasonable while processing

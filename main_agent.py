@@ -18,7 +18,6 @@ Save: savegame_brain/
 """
 
 import sys
-import time
 from pathlib import Path
 
 from mindai import Brain
@@ -84,7 +83,7 @@ def _c4_stream(min_len: int = 200):
     try:
         from datasets import load_dataset
     except ImportError:
-        print('>>> --c4 требует: pip install datasets')
+        print('>>> --c4 requires: pip install datasets')
         return
     ds = load_dataset('allenai/c4', 'en', split='train', streaming=True)
     for row in ds:
@@ -94,13 +93,13 @@ def _c4_stream(min_len: int = 200):
 
 
 def _build_world(sources: dict, c4: bool = False):
-    print('\n>>> Источники данных:')
+    print('\n>>> Data sources:')
     for k, v in sources.items():
         print(f'    {k:<8} -> {v}')
     if c4:
         print(f'    {"c4":<8} -> allenai/c4 (en, streaming, in-memory)')
     if not sources and not c4:
-        print('    (нет данных — только интерактивный режим)')
+        print('    (There are no data sources! Running with empty world...)')
     print()
 
     return AgentWorld(
@@ -155,12 +154,12 @@ def run():
     brain = _build_brain(world, rehab_ticks=rehab_ticks)
 
     if Path(_SAVE_DIR + '/brain.json').exists():
-        ans = input('Найден сохранённый мозг. Продолжить? (y/n): ').strip().lower()
+        ans = input('Found saved brain. Continue? (y/n): ').strip().lower()
         if ans == 'y':
             brain.load(_SAVE_DIR)
             world._tick_counter[0] = brain.tick
             world.world_tick = brain.tick
-            print(f'>>> Мозг успешно восстановлен на тике {brain.tick:,}. Продолжаем обучение.')
+            print(f'>>> Brain successfully restored at tick {brain.tick:,}. Continuing training.')
 
     tc           = world._tick_counter
     orig_execute = world.execute_action
@@ -174,7 +173,7 @@ def run():
         return result
 
     world.execute_action = _execute_with_log
-    print('>>> Запуск. Ctrl+C для сохранения и выхода.\n')
+    print('>>> Starting. Ctrl+C to save and exit.\n')
     brain.run(world, headless=True, checkpoint_interval=50000)
 
 

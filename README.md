@@ -29,8 +29,7 @@ they connect fired in close temporal proximity (Hebb 1949; Bi & Poo 1998).
 Neuromodulators *gate* how much plasticity occurs, never *which direction*
 to update — there is no teacher.
 
-The system is built around a recurrent sparse spiking network of 400 000 to
-1 500 000 neurons running on a single GPU. On top of that substrate, ~30 modules
+The system is built around a recurrent sparse spiking network of n count neurons running on a single GPU. On top of that substrate, ~30 modules
 implement specific anatomical structures of the human brain (PFC, amygdala,
 hippocampal subfields DG/CA3/CA1, cerebellum, basal ganglia, periaqueductal gray,
 locus coeruleus, etc.). Each module is documented against the peer-reviewed paper
@@ -41,6 +40,18 @@ language analog**: text, images with captions, video with audio, and Q&A pairs
 are presented to the agent and learned through Hebbian binding between sensory
 channels. Memory lives in synaptic weights, not in a context window;
 conversation and training are the same loop.
+
+Crucially, the current token channel is **character-level**, not BPE/subword.
+This is more biologically plausible for this project: cortex does not receive
+pre-segmented "perfect subword units" from a tokenizer trained offline. It must
+bind smaller perceptual units over time into stable lexical assemblies.
+Character streams let words with small spelling variations co-activate strongly
+overlapping neuron populations, which is closer to how distributed cortical
+representations generalize. For example, `home` and `hhome` share the same prefix
+characters and therefore drive much of the same pathway, so the learned concept
+assembly can still activate under minor misspelling instead of fragmenting into
+an unrelated token. That improves robustness to noisy spelling while staying
+closer to a biologically grounded incremental binding story.
 
 ---
 
@@ -79,7 +90,7 @@ a clock.
    ┌─────────▼──────────────┐
    │  FovealRetina          │  non-uniform foveal sampling (Curcio 1990)
    │  Cochlea               │  ERB-spaced basilar membrane (Glasberg & Moore 1990)
-   │  Token channel         │  tiktoken cl100k_base (8192-vocab cap)
+   │  Token channel         │  Character-level tokenizer (Russian + English)
    └─────────┬──────────────┘
              │ packed sensory vector
    ┌─────────▼─────────────────────────────────────────────────┐
@@ -327,7 +338,7 @@ mindai/
 ├── speech/                               Vocal apparatus + ear (faster-whisper)
 └── worlds/
     ├── agent_world.py                    Multimodal training + chat (primary)
-    └── tokenizers/                       tiktoken cl100k_base wrapper
+    └── tokenizers/                       Character tokenizer API
 ```
 
 ---
@@ -345,11 +356,12 @@ pip install -e .
 python main_agent.py                       # stdin chat + training
 python main_agent.py --data /other/path    # custom data directory
 python main_agent.py --c4                  # stream from allenai/c4 (pip install datasets)
-python main_agent.py --rehab-ticks 5000     # run in Rehabilitation Mode for 5k ticks
+python main_agent.py --rehab-ticks N       # optional rehabilitation-mode run length
 ```
 
 **Requirements:** Python 3.10+, PyTorch (CUDA strongly recommended for ≥400k neurons),
-NumPy, SciPy. Optional: tiktoken (better BPE tokenizer), `av` or `moviepy` for video.
+NumPy, SciPy. Optional: `datasets` for `--c4`, `av` or `moviepy` for video,
+`faster-whisper` for speech I/O.
 
 ---
 
@@ -361,15 +373,56 @@ data/
 ├── qa.txt                    question / answer pairs (alternating lines)
 ├── images/                   images with optional .txt captions
 │   ├── chair.jpg
-│   ├── chair.txt             "I see a chair. This is a chair."
+│   └── chair.txt             "I see a chair. This is a chair."
+├── video/                    videos with optional .txt captions
 │   ├── lecture.mp4
 │   └── lecture.txt
 └── audio/                    standalone audio files
 ```
 
-Curriculum weights (`main_agent.py:_CURRICULUM`): 65% text, 30% paired media,
-5% Q&A. Phases advance sequentially by tick count; phases without data are
-skipped automatically.
+## Curriculum: strict phase machine, no modality mixing
+
+Training in `mindai/worlds/agent_world.py` is **strictly phase-based**. Exactly
+**one curriculum source is active at a time**; the world does not mix text,
+images, video, and Q&A into one simultaneous stream.
+
+Architecturally, the curriculum progresses through the canonical order
+`text → images → video → qa`, with each phase activating only the sensory
+channels relevant to that source:
+
+| Phase  | Active source | Biological purpose |
+|--------|---------------|--------------------|
+| `text`   | `corpus.txt` or streamed text (`--c4`) | Build sequence statistics and predictive token dynamics |
+| `images` | `images/` + captions | Hebbian visual-text grounding via ostensive definition |
+| `video`  | `video/` + captions + extracted audio | Bind motion, sound, and text in one multisensory episode |
+| `qa`     | `qa.txt` | Build dialogue structure on top of grounded concepts |
+
+This design is deliberate. STDP binds whatever fires together in time, so
+parallel "everything at once" training would create **spurious bindings**:
+random corpus tokens could become associated with background audio, wall colors,
+or unrelated video frames simply because they co-occurred on the same tick.
+The phase machine prevents that by isolating modalities.
+
+Key implementation rules in the current world:
+
+- **No spurious binding:** each phase silences channels that do not belong to it.
+  During text/Q&A phases, paired vision is inactive. During non-video phases,
+  the audio channel is zeroed. During paired media episodes, corpus tokens do
+  not leak into the token stream.
+- **Exactly one active source:** the curriculum order is `text → images → video → qa`.
+  A new source is chosen only when the current token queue is empty, so the
+  world does not interrupt a sentence mid-stream.
+- **Automatic skipping:** if `images/`, `video/`, or `qa.txt` are missing, the
+  world automatically skips that phase instead of wasting ticks.
+- **Configurable scheduling:** phase boundaries are user-configurable at world
+  construction time via `phase_ticks={...}`; the phase machine itself is the
+  architectural invariant, not any particular numeric schedule.
+
+This phase isolation is scientifically important for MindAI. In a local
+Hebbian/STDP system, learning quality depends not only on what patterns are
+present, but on which patterns are allowed to be co-active. Preventing false
+co-activation is therefore part of the learning rule, not just a data-loading
+implementation detail.
 
 ---
 
