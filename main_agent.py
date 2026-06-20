@@ -30,7 +30,7 @@ from mindai.neurochemistry.neuromodulators import EndocrineSystem
 
 _SAVE_DIR           = 'savegame_brain'
 _NUM_NEURONS        = 400000
-_SYNAPSE_DENSITY    = 0.001
+_SYNAPSE_DENSITY    = 0.0006
 _CLOCK_ENERGY_SCALE = 0.05
 
 # Sensory channel sizes — all relative to _NUM_NEURONS so the layout scales.
