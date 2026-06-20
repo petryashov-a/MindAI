@@ -251,6 +251,8 @@ class FovealRetina:
             self._mss = mss.mss()
         except ImportError as e:
             raise ImportError("pip install mss") from e
+        except Exception:
+            self._mss = None
         try:
             import cv2
             self._cv2 = cv2
@@ -259,7 +261,11 @@ class FovealRetina:
 
         self.num_points = vision_size // _CHANNELS
         self._monitor = None
-        self._locate_window()
+        if self._mss is not None:
+            try:
+                self._locate_window()
+            except Exception:
+                self._monitor = None
 
         # Precompute non-uniform sampling grid
         self._xy, self._ecc = _build_sampling_grid(
@@ -306,6 +312,8 @@ class FovealRetina:
 
     def _capture_rgb(self) -> np.ndarray:
         """Return full-resolution (H, W, 3) uint8 RGB array."""
+        if self._mss is None or self._monitor is None:
+            raise RuntimeError('Screen capture is unavailable in this environment')
         shot = self._mss.grab(self._monitor)
         img  = np.frombuffer(shot.raw, dtype=np.uint8).reshape(shot.height, shot.width, 4)
         return img[:, :, [2, 1, 0]]   # BGRA → RGB
