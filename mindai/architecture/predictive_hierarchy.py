@@ -22,10 +22,25 @@ import torch
 
 class PredictiveMicrocircuits:
 
-    def __init__(self, num_nodes: int, initial_density: float = 0.005, device: torch.device | None = None):
+    def __init__(
+        self,
+        num_nodes: int,
+        initial_density: float = 0.005,
+        device: torch.device | None = None,
+        max_fan_in: int = 64,
+    ):
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.num_nodes       = num_nodes
-        num_connections      = int(num_nodes * num_nodes * initial_density)
+        self.num_nodes = num_nodes
+        dense_target = int(num_nodes * num_nodes * initial_density)
+        capped_target = int(num_nodes * max_fan_in)
+        num_connections = min(dense_target, capped_target)
+
+        # Predictive microcircuits are sparse local motifs, not a second full-brain
+        # all-to-all graph. Cap fan-in per neuron so startup memory scales linearly.
+        if dense_target > capped_target:
+            print(f'    [БИОЛОГИЯ] PredictiveMicrocircuits capped: '
+                  f'{dense_target:,} -> {num_connections:,} edges '
+                  f'(~{max_fan_in} / neuron)')
 
         # Coalesce duplicate (src, tgt) at init so values stay aligned with
         # _W_top sparse tensor (which always coalesces internally).
