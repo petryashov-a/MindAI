@@ -99,6 +99,8 @@ def estimate(num_neurons: int, density: float):
     print(f'    Синапсы на пике:    {fmt(syn_peak_gb):>10}')
     print(f'    Итого на старте:    {fmt(total_start_gb):>10}')
     print(f'    Итого на пике:      {fmt(total_peak_gb):>10}')
+    print('    * Это optimistic lower-bound estimate: не учитывает все временные')
+    print('      тензоры и peak memory при инициализации графа/кэшей на GPU.')
 
     print()
     print('  Совместимость GPU:')

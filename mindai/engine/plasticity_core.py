@@ -268,12 +268,12 @@ class StructuralPlasticity:
     # Neurogenesis — van Praag 2002; Eriksson 1998
     # ------------------------------------------------------------------
 
-    def _sample_proximity_pairs(
+    def _sample_proximity_pairs_chunk(
         self,
         src_candidates: torch.Tensor,
         tgt_candidates: torch.Tensor,
         n_pairs:        int,
-        sigma:          float = 2.0
+        sigma:          float = 2.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if len(src_candidates) == 0 or len(tgt_candidates) == 0:
             return (torch.empty(0, dtype=torch.long, device=self.device),
@@ -303,6 +303,30 @@ class StructuralPlasticity:
             tgt = tgt_pool[torch.arange(n_pairs, device=self.device), min_idxs]
 
         return src, tgt
+
+    def _sample_proximity_pairs(
+        self,
+        src_candidates: torch.Tensor,
+        tgt_candidates: torch.Tensor,
+        n_pairs:        int,
+        sigma:          float = 2.0,
+        chunk_size:     int   = 100_000,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if n_pairs <= chunk_size:
+            return self._sample_proximity_pairs_chunk(
+                src_candidates, tgt_candidates, n_pairs, sigma=sigma)
+
+        src_parts: list[torch.Tensor] = []
+        tgt_parts: list[torch.Tensor] = []
+        remaining = n_pairs
+        while remaining > 0:
+            cur = min(chunk_size, remaining)
+            src_chunk, tgt_chunk = self._sample_proximity_pairs_chunk(
+                src_candidates, tgt_candidates, cur, sigma=sigma)
+            src_parts.append(src_chunk)
+            tgt_parts.append(tgt_chunk)
+            remaining -= cur
+        return torch.cat(src_parts), torch.cat(tgt_parts)
 
     def _wire_new_neurons(self, old_limit: int, new_limit: int):
         """Grow axons and dendrites for newly activated neurons.
