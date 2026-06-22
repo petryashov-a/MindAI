@@ -13,6 +13,7 @@ Usage
     python main_agent.py                          # local GPU, stdin chat
     python main_agent.py --data /other/path       # custom data directory
     python main_agent.py --c4                     # stream from allenai/c4
+    python main_agent.py --non-interactive        # disable interactive stdin (e.g. on Colab)
 
 Save: savegame_brain/
 """
@@ -67,15 +68,17 @@ def _parse_args():
     data   = 'data'
     c4     = False
     rehab_ticks = 0
+    interactive = sys.stdin.isatty()
     i = 0
     while i < len(args):
         a = args[i]
         if   a == '--data' and i+1 < len(args): data = args[i+1]; i += 2
         elif a == '--c4':                       c4   = True;       i += 1
         elif a == '--rehab-ticks' and i+1 < len(args): rehab_ticks = int(args[i+1]); i += 2
+        elif a == '--non-interactive':          interactive = False; i += 1
         elif a in ('-h', '--help'): print(__doc__); sys.exit(0)
         else: i += 1
-    return Path(data), c4, rehab_ticks
+    return Path(data), c4, rehab_ticks, interactive
 
 
 def _c4_stream(min_len: int = 200):
@@ -92,7 +95,7 @@ def _c4_stream(min_len: int = 200):
             yield t
 
 
-def _build_world(sources: dict, c4: bool = False):
+def _build_world(sources: dict, c4: bool = False, interactive: bool = True):
     print('\n>>> Data sources:')
     for k, v in sources.items():
         print(f'    {k:<8} -> {v}')
@@ -110,7 +113,7 @@ def _build_world(sources: dict, c4: bool = False):
         audio_source = sources.get('audio'),
         vision_size  = _VISION_SIZE,
         audio_size   = _AUDIO_SIZE,
-        interactive  = True,
+        interactive  = interactive,
         text_stream  = _c4_stream() if c4 else None,
     )
 
@@ -147,14 +150,18 @@ def _build_brain(world, rehab_ticks=0):
 # ---------------------------------------------------------------------------
 
 def run():
-    data_dir, c4, rehab_ticks = _parse_args()
+    data_dir, c4, rehab_ticks, interactive = _parse_args()
     sources = _discover_data(data_dir)
 
-    world = _build_world(sources, c4=c4)
+    world = _build_world(sources, c4=c4, interactive=interactive)
     brain = _build_brain(world, rehab_ticks=rehab_ticks)
 
     if Path(_SAVE_DIR + '/brain.json').exists():
-        ans = input('Found saved brain. Continue? (y/n): ').strip().lower()
+        if interactive:
+            ans = input('Found saved brain. Continue? (y/n): ').strip().lower()
+        else:
+            print('>>> Found saved brain. Auto-continuing training.')
+            ans = 'y'
         if ans == 'y':
             brain.load(_SAVE_DIR)
             world._tick_counter[0] = brain.tick
