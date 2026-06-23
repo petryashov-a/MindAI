@@ -72,6 +72,11 @@ class StructuralPlasticity:
             coords[:, 0] = 10.0 * np.cos(theta) * sin_phi
             coords[:, 1] = 10.0 * np.sin(theta) * sin_phi
             coords[:, 2] = 10.0 * np.cos(phi)
+            # Sort fallback coordinates by Morton code
+            from mindai.engine.spatial_topology_3d import get_morton_codes_np
+            morton_codes = get_morton_codes_np(coords)
+            sort_idx = np.argsort(morton_codes)
+            coords = coords[sort_idx]
             self.coordinates = torch.from_numpy(coords).to(self.device)
 
         self.is_inhibitory_tensor = torch.rand(num_nodes, device=self.device) < inhibitory_ratio
@@ -93,7 +98,8 @@ class StructuralPlasticity:
 
         # LIF Membrane potential and threshold parameters
         self.v_mem = torch.zeros(num_nodes, device=self.device)
-        self.v_thresh = 1.0
+        self.firing_thresholds = torch.ones(num_nodes, device=self.device)
+        self.firing_rates = torch.full((num_nodes,), 0.05, device=self.device)
         self.v_reset = 0.0
         self.v_leak = 0.8
 
@@ -142,11 +148,11 @@ class StructuralPlasticity:
     # Single-neuron dynamics — refractory + adaptation (applied before STDP)
     # ------------------------------------------------------------------
 
-    def apply_neural_dynamics(self, activity: torch.Tensor) -> torch.Tensor:
+    def apply_neural_dynamics(self, activity: torch.Tensor, acetylcholine: float = 0.5) -> torch.Tensor:
         """Enforce refractory period, spike-frequency adaptation, and LIF integration.
 
         Integrates incoming activation (current) into membrane potential v_mem,
-        generating a binary spike when threshold v_thresh is reached, and then
+        generating a binary spike when threshold is reached, and then
         resetting membrane potential and applying refractory periods.
 
         Refractory: Hodgkin & Huxley 1952 — absolute refractory 2 ticks.
@@ -159,11 +165,22 @@ class StructuralPlasticity:
         adaptation_gain = torch.clamp(1.0 - self._adaptation * 0.7, 0.3, 1.0)
         input_current = activity * adaptation_gain * (~refractory_mask).float()
 
-        # Integrate input current into membrane potential
-        self.v_mem += input_current
+        # Somatic lateral feedback inhibition (GABAergic basket cell feedback)
+        # Total excitation of the excitatory population is summed
+        exc_mask = ~self.is_inhibitory_tensor
+        total_exc = (input_current * exc_mask.float()).sum()
 
-        # Detect spikes
-        fired_now = self.v_mem >= self.v_thresh
+        # Acetylcholine modulates inhibition: high ACh (attention) -> less inhibition
+        # We apply feedback inhibition to suppress weaker signals and maintain sparsity
+        inh_gain = 0.02 * (1.0 - acetylcholine * 0.4)
+        feedback_inh = total_exc * inh_gain
+
+        # Integrate input current and apply feedforward somatic inhibition to excitatory neurons
+        self.v_mem += input_current
+        self.v_mem[exc_mask] = torch.clamp(self.v_mem[exc_mask] - feedback_inh, min=0.0)
+
+        # Detect spikes using individual dynamic homeostatic thresholds
+        fired_now = self.v_mem >= self.firing_thresholds
 
         # Reset membrane potential and trigger refractory for winners
         self.v_mem[fired_now] = self.v_reset
@@ -180,6 +197,17 @@ class StructuralPlasticity:
         self._adaptation *= 0.90
         self._adaptation[fired_now] = torch.clamp(
             self._adaptation[fired_now] + 0.15, 0.0, 1.0)
+
+        # Intrinsic Excitability Homeostasis:
+        # Firing rate estimate (exponential moving average, alpha=0.01)
+        self.firing_rates = (1.0 - 0.01) * self.firing_rates + 0.01 * fired_now.float()
+
+        # Adjust thresholds: increase if firing rate is too high, decrease if too low (silent)
+        # Target sparsity is 0.05. beta = 0.02. Range clamped to biological [0.2, 5.0]
+        self.firing_thresholds = torch.clamp(
+            self.firing_thresholds + 0.02 * (self.firing_rates - 0.05),
+            min=0.2, max=5.0
+        )
 
         return fired_now.float()
 
@@ -483,53 +511,38 @@ class StructuralPlasticity:
         target_sparsity: float = 0.05,
         acetylcholine:   float = 0.5,
     ) -> torch.Tensor:
-        """k-Winners-Take-All via fast GABAergic interneurons.
+        """Cell-autonomous lateral inhibition.
 
-        Basket cells (PV+) provide perisomatic inhibition to all non-winners
-        within a cortical column within ~5 ms — effectively instantaneous at
-        our tick resolution (Freund & Katona 2007).
-
-        Acetylcholine modulates sparsity: high ACh (attention/novelty) → broader
-        activation (more winners); low ACh (rest) → tighter competition
-        (Hasselmo & McGaughy 2004).
-
-        k is computed on GPU via torch.topk — O(n log k), no CPU round-trip.
-        Excitatory winners keep their activation; inhibited neurons are clamped
-        to zero (not just suppressed) to model hyperpolarisation by GABA-A.
-        Inhibitory neurons (GABA) are exempt — they fire freely.
+        Sparsity and lateral competition are maintained through dynamic homeostatic
+        thresholds and population somatic feedback during integration, removing the
+        need for global top-k sorting.
         """
-        n = activity.shape[0]
-        # ACh broadens the active pool: sparsity shrinks at high ACh
-        effective_sparsity = target_sparsity * (1.0 - acetylcholine * 0.4)
-        k = max(1, int(n * effective_sparsity))
-
-        # Inhibitory neurons always pass through (they ARE the inhibition)
-        excitatory_mask = ~self.is_inhibitory_tensor[:n]
-        exc_activity    = activity * excitatory_mask.float()
-
-        # topk on GPU — no sort of full array, O(n log k)
-        threshold_val = torch.topk(exc_activity, k, sorted=False).values.min()
-
-        # Winners: top-k excitatory + all inhibitory
-        winner_mask = (exc_activity >= threshold_val) | self.is_inhibitory_tensor[:n]
-        return activity * winner_mask.float()
+        return activity
 
     # ------------------------------------------------------------------
     # Structural plasticity
     # ------------------------------------------------------------------
 
+    def perform_sleep_pruning(self):
+        """Prune weak/unused synapses during sleep (Tononi 2006 SHY).
+
+        Synapses with low integrity (integrity < 0.05) and very small weights
+        are selectively pruned.
+        """
+        weak_mask = (self.integrity_values < 0.05) & (self.weights_values.abs() < 0.01)
+        alive_mask = ~weak_mask
+
+        if not alive_mask.all():
+            self.indices          = self.indices[:, alive_mask]
+            self.weights_values   = self.weights_values[alive_mask]
+            self.integrity_values = self.integrity_values[alive_mask]
+            self.eligibility      = self.eligibility[alive_mask]
+            self._stp_u           = self._stp_u[alive_mask]
+            self._stp_x           = self._stp_x[alive_mask]
+            self._topology_changed = True
+
     def synaptogenesis_and_pruning(self, active_nodes: torch.Tensor, energy_level: float):
-        # Pruning: drop dead synapses (integrity == 0) — must keep STP in sync
-        if random.random() < 0.1:
-            alive_mask = self.integrity_values > 0.0
-            if not alive_mask.all():
-                self.indices          = self.indices[:, alive_mask]
-                self.weights_values   = self.weights_values[alive_mask]
-                self.integrity_values = self.integrity_values[alive_mask]
-                self.eligibility      = self.eligibility[alive_mask]
-                self._stp_u           = self._stp_u[alive_mask]
-                self._stp_x           = self._stp_x[alive_mask]
-                self._topology_changed = True
+        # Wake phase only handles growth/synaptogenesis, pruning is sleep-driven.
 
         # Growth: spawn new synapses between co-active neurons
         if energy_level > 1000.0 and random.random() < 0.05:

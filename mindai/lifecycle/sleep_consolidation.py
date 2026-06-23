@@ -200,6 +200,10 @@ class SleepCycle:
         plasticity.weights_values = torch.clamp(plasticity.weights_values, -1.0, 1.0)
         plasticity._topology_changed = True
 
+        # Call pruning periodically during N3 (every 20 ticks) to clear weak/unused synapses
+        if self.ticks_in_phase % 20 == 0:
+            plasticity.perform_sleep_pruning()
+
         return SleepResult(
             still_sleeping=True,
             dream_activity=None,

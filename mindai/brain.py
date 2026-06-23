@@ -207,6 +207,7 @@ class Brain:
 
         # Core neural substrate — always present
         self._geometry      = BrainGeometry(num_neurons)
+        self._geometry.optimize_spatial_locality(self._layout)
         self._plasticity    = StructuralPlasticity(
             num_neurons,
             initial_density=synapse_density,
@@ -214,7 +215,8 @@ class Brain:
             coordinates=self._geometry.coordinates
         )
         self._time          = HusserlianTime(num_neurons, window_size=3, device=self._device)
-        self._predictor     = PredictiveMicrocircuits(num_neurons, device=self._device)
+        pred_density = min(0.005, 100.0 / num_neurons)
+        self._predictor     = PredictiveMicrocircuits(num_neurons, initial_density=pred_density, device=self._device)
         self._workspace     = PhaseCoupledWorkspace(num_neurons, self._device)
         self._thalamus      = Thalamus(num_neurons, self._device)
         self._ego           = EgoModel(expected_baseline=1.0)
@@ -315,12 +317,13 @@ class Brain:
         # Axonal delays — GPU ring buffer (Swadlow 1985)
         self._delay_queue = DelayQueue(
             num_neurons, max_delay_ticks=20, device=self._device)
-        self._edge_delays = build_delay_tensor(
+        self._base_delays = build_delay_tensor(
             self._plasticity.indices[0],
             self._plasticity.indices[1],
             self._geometry.coordinates,
             device=self._device,
         )
+        self.update_myelinated_delays()
 
         self._activity = torch.zeros(num_neurons, device=self._device)
 
@@ -417,7 +420,26 @@ class Brain:
         Returns True on success.
         """
         p = path or self.save_path
-        return self._load_dir(p)
+        res = self._load_dir(p)
+        if res:
+            self._base_delays = build_delay_tensor(
+                self._plasticity.indices[0],
+                self._plasticity.indices[1],
+                self._geometry.coordinates,
+                device=self._device,
+            )
+            self.update_myelinated_delays()
+        return res
+
+    def update_myelinated_delays(self) -> None:
+        """Scale conduction delay dynamically based on synaptic integrity (myelination).
+
+        As synapses are active and consolidate (high integrity), oligodendrocytes
+        myelinate the axons, increasing conduction velocity (reducing delay).
+        """
+        integrity = self._plasticity.integrity_values
+        scaled_delays = self._base_delays.float() / (1.0 + 1.5 * integrity)
+        self._edge_delays = torch.clamp(torch.round(scaled_delays), min=1.0).to(torch.int16)
 
     def save(self, path: str | None = None, world = None) -> None:
         """Save brain weights (brain state only — world state not included)."""
@@ -961,13 +983,17 @@ class Brain:
                     eff_weights = self._plasticity.get_stp_scaled_weights()
                     # Rebuild edge-delay tensor if synaptogenesis/pruning changed topology
                     n_edges = self._plasticity.indices.shape[1]
-                    if self._edge_delays.shape[0] != n_edges:
-                        self._edge_delays = build_delay_tensor(
+                    if not hasattr(self, '_base_delays') or self._base_delays.shape[0] != n_edges:
+                        self._base_delays = build_delay_tensor(
                             self._plasticity.indices[0],
                             self._plasticity.indices[1],
                             self._geometry.coordinates,
                             device=self._device,
                         )
+                        self.update_myelinated_delays()
+                    elif self.tick % 20 == 0:
+                        # Periodically update myelination based on active plasticity consolidation (integrity)
+                        self.update_myelinated_delays()
                     self._delay_queue.enqueue(
                         self._activity,
                         self._plasticity.indices[0],
@@ -995,7 +1021,8 @@ class Brain:
                         self._time.create_conscious_now(combined, fep_state), 0.0, 1.0)
 
                     # Refractory period + spike-frequency adaptation (Hodgkin & Huxley 1952)
-                    self._activity = self._plasticity.apply_neural_dynamics(self._activity)
+                    self._activity = self._plasticity.apply_neural_dynamics(
+                        self._activity, acetylcholine=getattr(chem, 'acetylcholine', 0.5))
 
                     # Cortical lateral inhibition — GABAergic basket cells (Buzsáki 2004)
                     # Applied after refractory/adaptation, before thalamic gating.
