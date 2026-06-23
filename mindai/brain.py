@@ -215,8 +215,8 @@ class Brain:
             coordinates=self._geometry.coordinates
         )
         self._time          = HusserlianTime(num_neurons, window_size=3, device=self._device)
-        pred_density = min(0.005, 100.0 / num_neurons)
-        self._predictor     = PredictiveMicrocircuits(num_neurons, initial_density=pred_density, device=self._device)
+        pred_density = min(0.005, 12.0 / num_neurons)
+        self._predictor     = PredictiveMicrocircuits(num_neurons, initial_density=pred_density, device=self._device, max_fan_in=16)
         self._workspace     = PhaseCoupledWorkspace(num_neurons, self._device)
         self._thalamus      = Thalamus(num_neurons, self._device)
         self._ego           = EgoModel(expected_baseline=1.0)
