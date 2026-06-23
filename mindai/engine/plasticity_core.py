@@ -135,8 +135,8 @@ class StructuralPlasticity:
         self._stp_u = torch.full((n_syn,), 0.3, device=self.device)  # utilization
         self._stp_x = torch.ones(n_syn,        device=self.device)  # vesicle fraction
 
-        self._cached_sparse_weights = None
-        self._cached_sparse_weights_stp = None
+        self._stp_x = torch.ones(n_syn,        device=self.device)  # vesicle fraction
+
         self._topology_changed      = True
 
         # Critical-period plasticity (Hensch 2005)
@@ -241,43 +241,31 @@ class StructuralPlasticity:
         self._stp_x           = torch.clamp(merged[:, 3], 0.0, 1.0)
         self.eligibility      = merged[:, 4].clone()
         
-        # Free temporaries before creating sparse matrix
+        # Free temporaries
         del combined, keys, unique_keys, inverse_indices, merged
         
-        coo = torch.sparse_coo_tensor(
-            torch.stack([self.indices[1], self.indices[0]]), self.weights_values, (self.num_nodes, self.num_nodes)).coalesce()
-        self._cached_sparse_weights = coo
         self._topology_changed = False
 
-        # Compute permutation mapping for transposed sparse matrix representation (sorted indices[1], indices[0])
-        # This handles the index swap sorting correct mapping when copying values back.
-        keys = self.indices[1] * self.num_nodes + self.indices[0]
-        self._transpose_perm = torch.argsort(keys)
-
-    def get_sparse_weights(self, apply_stp: bool = False) -> torch.Tensor:
-        """Return cached sparse weight matrix, optionally scaled by STP efficacy.
-
-        apply_stp=True: weights multiplied by u*x (release probability × vesicles).
-        Called with apply_stp=True each tick from brain.py; False during sleep replay
-        where STP state should not be consumed.
+    def multiply_weights(self, x: torch.Tensor, apply_stp: bool = False) -> torch.Tensor:
+        """Multiply vector x by the sparse weight matrix (W * x).
+        
+        Bypasses torch.sparse.mm and sparse_coo_tensor to avoid massive
+        memory leaks in PyTorch's ATen backend for large sparse matrices.
         """
-        if getattr(self, '_topology_changed', True) or self._cached_sparse_weights is None:
+        if getattr(self, '_topology_changed', True):
             self._coalesce_state()
-        else:
-            self._cached_sparse_weights.values().copy_(self.weights_values[self._transpose_perm])
 
+        weights = self.weights_values
         if apply_stp:
-            stp_efficacy = self._stp_u * self._stp_x   # release probability × resource
-            eff_vals = self.weights_values * stp_efficacy
-            if getattr(self, '_cached_sparse_weights_stp', None) is None or self._topology_changed:
-                coo_stp = torch.sparse_coo_tensor(
-                    torch.stack([self.indices[1], self.indices[0]]), eff_vals, (self.num_nodes, self.num_nodes)).coalesce()
-                self._cached_sparse_weights_stp = coo_stp
-            else:
-                self._cached_sparse_weights_stp.values().copy_(eff_vals[self._transpose_perm])
-            return self._cached_sparse_weights_stp
+            weights = weights * (self._stp_u * self._stp_x)
 
-        return self._cached_sparse_weights
+        # src is indices[0], tgt is indices[1]
+        # x_pre = x[src] * weights
+        msg = x[self.indices[0]] * weights
+        
+        out = torch.zeros_like(x)
+        out.scatter_add_(0, self.indices[1], msg)
+        return out
 
     def get_stp_scaled_weights(self) -> torch.Tensor:
         """Return raw flat weights scaled by current STP efficacy (release probability * resources)."""

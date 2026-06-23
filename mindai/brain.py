@@ -1022,9 +1022,9 @@ class Brain:
                     # instantaneous sparse.mm kept as small direct-coupling leak (0.05×)
                     # because axonal delays are capped at 20 ticks — very long-range
                     # connections beyond that still need some path.
-                    brain_w   = self._plasticity.get_sparse_weights()
-                    recurrent = delayed_psp + torch.sparse.mm(
-                        brain_w, self._activity.unsqueeze(1)).squeeze(1) * 0.05
+                    # connections beyond that still need some path.
+                    recurrent = delayed_psp + self._plasticity.multiply_weights(
+                        self._activity, apply_stp=True) * 0.05
                     # clamp on GPU — no CPU round-trip for clip
                     combined  = torch.clamp(raw_t + recurrent * 0.1, 0.0, 1.0)
 
@@ -1281,21 +1281,18 @@ class Brain:
                     # LZ76 complexity + spectral radius via GPU power iteration.
                     # Replaces scipy CSR build which spiked memory to 2+ GB.
                     if self.tick % 100 == 0:
-                        _w_pi = self._plasticity.get_sparse_weights()
                         _v_pi = self._activity.clone()
                         _n_pi = _v_pi.norm()
                         _spectral_r = 0.0
                         if _n_pi > 1e-12:
                             _v_pi = _v_pi / _n_pi
                             for _ in range(15):
-                                _v_pi = torch.sparse.mm(
-                                    _w_pi, _v_pi.unsqueeze(1)).squeeze(1)
+                                _v_pi = self._plasticity.multiply_weights(_v_pi, apply_stp=False)
                                 _n_pi = _v_pi.norm()
                                 if _n_pi < 1e-12:
                                     break
                                 _v_pi = _v_pi / _n_pi
-                            _spectral_r = float(
-                                torch.sparse.mm(_w_pi, _v_pi.unsqueeze(1)).squeeze(1).norm())
+                            _spectral_r = float(self._plasticity.multiply_weights(_v_pi, apply_stp=False).norm())
                         qualia_shape = self._nc.calculate(act_cpu, spectral_radius=_spectral_r)
                         # Spectral radius proxy → ignition bias (Beggs & Plenz 2003):
                         # near-critical networks (ρ≈1) show maximal dynamic range.
