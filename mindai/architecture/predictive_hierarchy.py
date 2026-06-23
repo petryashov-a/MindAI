@@ -66,9 +66,6 @@ class PredictiveMicrocircuits:
         self.prediction_neurons  = torch.zeros(num_nodes, device=self.device)
         self.error_neurons       = torch.zeros(num_nodes, device=self.device)
 
-        self._W_top: torch.Tensor | None = None
-        self._W_bot: torch.Tensor | None = None
-
     def process_inference_step(
         self,
         sensory_input:    torch.Tensor,
@@ -76,19 +73,13 @@ class PredictiveMicrocircuits:
         plasticity_rate:  float,
     ) -> tuple:
         # ------------------------------------------------------------------
-        # 1. Top-down prediction (rebuild sparse tensor only when weights changed)
+        # 1. Top-down prediction (direct scatter-add, bypassing sparse.mm)
         # ------------------------------------------------------------------
-        dev = sensory_input.device
-        if self._W_top is None:
-            self._W_top = torch.sparse_coo_tensor(
-                self.td_indices, self.td_values,
-                (self.num_nodes, self.num_nodes)).coalesce().to(dev)
-        else:
-            self._W_top.values().copy_(self.td_values.to(dev))
-        W_top = self._W_top
-        self.prediction_neurons = torch.clamp(
-            torch.sparse.mm(W_top, internal_state.unsqueeze(1)).squeeze(1),
-            0.0, 1.0)
+        msg_top = internal_state[self.td_indices[1]] * self.td_values
+        pred = torch.zeros_like(sensory_input)
+        pred.scatter_add_(0, self.td_indices[0], msg_top)
+        
+        self.prediction_neurons = torch.clamp(pred, 0.0, 1.0)
 
         # ------------------------------------------------------------------
         # 2. Bidirectional prediction error (signed, not relu)
@@ -102,15 +93,10 @@ class PredictiveMicrocircuits:
         # ------------------------------------------------------------------
         # 3. Bottom-up drive: propagate signed error to update internal state
         # ------------------------------------------------------------------
-        if self._W_bot is None:
-            self._W_bot = torch.sparse_coo_tensor(
-                self.bu_indices, self.bu_values,
-                (self.num_nodes, self.num_nodes)).coalesce().to(dev)
-        else:
-            self._W_bot.values().copy_(self.bu_values.to(dev))
-        W_bot = self._W_bot
-        bottom_up_drive = torch.sparse.mm(
-            W_bot, self.error_neurons.unsqueeze(1)).squeeze(1)
+        msg_bot = self.error_neurons[self.bu_indices[1]] * self.bu_values
+        bottom_up_drive = torch.zeros_like(internal_state)
+        bottom_up_drive.scatter_add_(0, self.bu_indices[0], msg_bot)
+        
         updated_internal_state = torch.clamp(
             internal_state + bottom_up_drive, 0.0, 1.0)
 
