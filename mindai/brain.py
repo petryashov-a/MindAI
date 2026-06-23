@@ -47,6 +47,7 @@ when moved to a new environment.
 
 from __future__ import annotations
 
+import gc
 import json
 import time
 from pathlib import Path
@@ -173,6 +174,9 @@ class Brain:
         num_actions:         int   = 5,
         synapse_density:     float = 0.01,
         rehab_ticks:         int   = 0,
+        k_candidates:        int   = 8,
+        binder_text_dim:     int | None = None,
+        episode_top_k:       int   = 1024,
     ) -> None:
         if device == 'auto':
             if torch.cuda.is_available():
@@ -212,11 +216,20 @@ class Brain:
             num_neurons,
             initial_density=synapse_density,
             device=self._device,
-            coordinates=self._geometry.coordinates
+            coordinates=self._geometry.coordinates,
+            k_candidates=k_candidates,
         )
+        # Free init temporaries before next heavy allocation
+        gc.collect()
+        if self._device.type == 'cuda':
+            torch.cuda.empty_cache()
         self._time          = HusserlianTime(num_neurons, window_size=3, device=self._device)
         pred_density = min(0.005, 12.0 / num_neurons)
         self._predictor     = PredictiveMicrocircuits(num_neurons, initial_density=pred_density, device=self._device, max_fan_in=16)
+        # Free _build temporaries
+        gc.collect()
+        if self._device.type == 'cuda':
+            torch.cuda.empty_cache()
         self._workspace     = PhaseCoupledWorkspace(num_neurons, self._device)
         self._thalamus      = Thalamus(num_neurons, self._device)
         self._ego           = EgoModel(expected_baseline=1.0)
@@ -228,7 +241,7 @@ class Brain:
         self._sc: SuperiorColliculus | None = (
             SuperiorColliculus() if vision_size > 0 else None
         )
-        self._hippocampus   = Hippocampus()
+        self._hippocampus   = Hippocampus(episode_top_k=episode_top_k)
         # New biology — anti-reward, defence switch, glia, hippocampal subfields,
         # grid/place coding, olfaction
         self._habenula      = Habenula()
@@ -296,8 +309,9 @@ class Brain:
         _vision_dim = int(sensory_layout.get('vision', 64))
         self._lang_audio_dim  = _audio_dim
         self._lang_vision_dim = _vision_dim
+        self._binder_text_dim = binder_text_dim if binder_text_dim is not None else _lang_token_dim
         self._cross_modal_binder = CrossModalBinder(modality_dims={
-            'text':        _lang_token_dim,
+            'text':        self._binder_text_dim,
             'audio':       _audio_dim,
             'vision':      _vision_dim,
             'interoception': 4,   # [pain, hunger, thirst, arousal]
@@ -1180,7 +1194,7 @@ class Brain:
                     _vis_vec  = act_cpu[_sl_vision] if _sl_vision is not None else np.zeros(self._lang_vision_dim)
                     _aud_vec  = act_cpu[_sl_audio]  if _sl_audio  is not None else np.zeros(self._lang_audio_dim)
                     _bind_recall = self._cross_modal_binder.update({
-                        'text':         _tok_sdr,
+                        'text':         _tok_sdr[:self._binder_text_dim],
                         'audio':        _aud_vec,
                         'vision':       _vis_vec,
                         'interoception': _intero_vec,
@@ -1188,8 +1202,11 @@ class Brain:
                     # Recalled cross-modal signal reinforces the text column
                     _text_recall = _bind_recall.get('text', None)
                     if _text_recall is not None and _text_recall.any():
+                        # Zero-pad recalled text back to full SDR dimension
+                        _text_recall_full = np.zeros_like(_tok_sdr)
+                        _text_recall_full[:len(_text_recall)] = _text_recall
                         # Blend recalled multimodal signal back into SDR encoder
-                        self._sdr_encoder.update_reconstruction(_tok_sdr, _text_recall)
+                        self._sdr_encoder.update_reconstruction(_tok_sdr, _text_recall_full)
 
                     # Dialogue ToM update — called when an interlocutor speaks
                     _interlocutor_text = getattr(world, 'last_interlocutor_token', None)

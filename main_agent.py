@@ -34,6 +34,11 @@ _NUM_NEURONS        = 250000
 _SYNAPSE_DENSITY    = 0.0006
 _CLOCK_ENERGY_SCALE = 0.05
 
+# Memory/Quality Trade-off Configuration
+_K_CANDIDATES       = 4     # Number of candidates for proximity sampling (default 8)
+_BINDER_TEXT_DIM    = 256   # Text dimensionality for CrossModalBinder (default 5000)
+_EPISODE_TOP_K      = 1024  # Sparsity limit for episodic memory (default 1024)
+
 # Sensory channel sizes — all relative to _NUM_NEURONS so the layout scales.
 # Vision: 0.576% — FovealRetina (Curcio 1990), must be divisible by 5.
 # Audio:  0.154% — A1/V1 ratio in human cortex ~8%/30% × vision (Elston 2003).
@@ -139,6 +144,9 @@ def _build_brain(world, rehab_ticks=0):
         num_actions    = world.tokenizer.vocab_size,
         synapse_density= _SYNAPSE_DENSITY,
         rehab_ticks    = rehab_ticks,
+        k_candidates   = _K_CANDIDATES,
+        binder_text_dim= _BINDER_TEXT_DIM,
+        episode_top_k  = _EPISODE_TOP_K,
     )
     brain.attach(EndocrineSystem())
     brain._clock_energy_scale = _CLOCK_ENERGY_SCALE

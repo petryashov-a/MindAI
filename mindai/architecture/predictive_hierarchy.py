@@ -17,6 +17,7 @@ Biological basis (Friston 2005; Bastos et al. 2012):
   (mentioned as known sharp edge in CLAUDE.md).
 """
 
+import numpy as np
 import torch
 
 
@@ -45,21 +46,22 @@ class PredictiveMicrocircuits:
         # Coalesce duplicate (src, tgt) at init so values stay aligned with
         # _W_top sparse tensor (which always coalesces internally).
         def _build(n):
-            # Generate and sort indices on CPU to prevent heavy CUDA memory overhead during coalesce
-            idx_cpu = torch.randint(0, num_nodes, (2, n), device='cpu')
-            keys = idx_cpu[0] * num_nodes + idx_cpu[1]
-            sorted_keys, sort_idx = torch.sort(keys)
-            mask = torch.cat([torch.tensor([True]), sorted_keys[1:] != sorted_keys[:-1]])
-            sorted_idx = idx_cpu[:, sort_idx][:, mask]
+            # Generate and deduplicate on CPU via numpy (lower peak RAM than torch)
+            rng = np.random.default_rng()
+            idx_np = rng.integers(0, num_nodes, size=(2, n), dtype=np.int64)
+            keys = idx_np[0] * num_nodes + idx_np[1]
+            _, unique_idx = np.unique(keys, return_index=True)
+            unique_idx.sort()  # preserve original order among uniques
+            deduped = idx_np[:, unique_idx]
+            # Sort by (src, tgt) for coalesced sparse tensor compatibility
+            sort_keys = deduped[0] * num_nodes + deduped[1]
+            sort_order = np.argsort(sort_keys)
+            sorted_idx = deduped[:, sort_order]
             vals = torch.rand(sorted_idx.shape[1], device=self.device) * 0.1
-            return sorted_idx.to(self.device), vals
+            return torch.from_numpy(sorted_idx.copy()).to(self.device), vals
 
         self.td_indices, self.td_values = _build(num_connections)
         self.bu_indices, self.bu_values = _build(num_connections)
-
-        # Pre-compute value permutation mappings (already sorted, so sequential range)
-        self.td_perm = torch.arange(self.td_values.shape[0], dtype=torch.long, device=self.device)
-        self.bu_perm = torch.arange(self.bu_values.shape[0], dtype=torch.long, device=self.device)
 
         self.prediction_neurons  = torch.zeros(num_nodes, device=self.device)
         self.error_neurons       = torch.zeros(num_nodes, device=self.device)
@@ -82,7 +84,7 @@ class PredictiveMicrocircuits:
                 self.td_indices, self.td_values,
                 (self.num_nodes, self.num_nodes)).coalesce().to(dev)
         else:
-            self._W_top.values().copy_(self.td_values[self.td_perm].to(dev))
+            self._W_top.values().copy_(self.td_values.to(dev))
         W_top = self._W_top
         self.prediction_neurons = torch.clamp(
             torch.sparse.mm(W_top, internal_state.unsqueeze(1)).squeeze(1),
@@ -105,7 +107,7 @@ class PredictiveMicrocircuits:
                 self.bu_indices, self.bu_values,
                 (self.num_nodes, self.num_nodes)).coalesce().to(dev)
         else:
-            self._W_bot.values().copy_(self.bu_values[self.bu_perm].to(dev))
+            self._W_bot.values().copy_(self.bu_values.to(dev))
         W_bot = self._W_bot
         bottom_up_drive = torch.sparse.mm(
             W_bot, self.error_neurons.unsqueeze(1)).squeeze(1)

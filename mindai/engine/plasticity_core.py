@@ -38,6 +38,7 @@ class StructuralPlasticity:
         inhibitory_ratio: float = 0.2,
         device:           torch.device | None = None,
         coordinates:      np.ndarray | None = None,
+        k_candidates:     int = 8,
     ):
         self.device           = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.num_nodes        = num_nodes
@@ -50,6 +51,7 @@ class StructuralPlasticity:
         self.hunger_threshold = 100.0
         self.growth_cooldown  = 0
         self._initial_density = initial_density
+        self._k_candidates    = k_candidates
 
         # Homeostatic target: mean incoming weight sum per neuron.
         # At density d, each neuron has ~d*N inputs; target keeps mean weight ~0.5.
@@ -224,11 +226,13 @@ class StructuralPlasticity:
             (self.num_nodes, self.num_nodes, 5)).coalesce()
         self.indices          = temp.indices()
         v                     = temp.values()
-        self.weights_values   = v[:, 0]
+        self.weights_values   = v[:, 0].clone()
         self.integrity_values = torch.clamp(v[:, 1], 0.0, 2.0)
         self._stp_u           = torch.clamp(v[:, 2], 0.0, 1.0)
         self._stp_x           = torch.clamp(v[:, 3], 0.0, 1.0)
-        self.eligibility      = v[:, 4]
+        self.eligibility      = v[:, 4].clone()
+        # Free the 5-column sparse tensor before building the next one
+        del temp, combined, v
         coo = torch.sparse_coo_tensor(
             torch.stack([self.indices[1], self.indices[0]]), self.weights_values, (self.num_nodes, self.num_nodes)).coalesce()
         self._cached_sparse_weights = coo
@@ -319,7 +323,7 @@ class StructuralPlasticity:
         if len(tgt_candidates) == 1:
             tgt = tgt_candidates.expand(n_pairs)
         else:
-            k_candidates = min(8, len(tgt_candidates))
+            k_candidates = min(self._k_candidates, len(tgt_candidates))
             tgt_pool_idxs = torch.randint(0, len(tgt_candidates), (n_pairs, k_candidates), device=self.device)
             tgt_pool = tgt_candidates[tgt_pool_idxs]
 
