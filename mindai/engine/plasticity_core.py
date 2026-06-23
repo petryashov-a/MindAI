@@ -231,7 +231,7 @@ class StructuralPlasticity:
         self.eligibility      = v[:, 4]
         coo = torch.sparse_coo_tensor(
             torch.stack([self.indices[1], self.indices[0]]), self.weights_values, (self.num_nodes, self.num_nodes)).coalesce()
-        self._cached_sparse_weights = coo.to_sparse_csr()
+        self._cached_sparse_weights = coo
         self._topology_changed = False
 
         # Compute permutation mapping for transposed sparse matrix representation (sorted indices[1], indices[0])
@@ -257,7 +257,7 @@ class StructuralPlasticity:
             if getattr(self, '_cached_sparse_weights_stp', None) is None or self._topology_changed:
                 coo_stp = torch.sparse_coo_tensor(
                     torch.stack([self.indices[1], self.indices[0]]), eff_vals, (self.num_nodes, self.num_nodes)).coalesce()
-                self._cached_sparse_weights_stp = coo_stp.to_sparse_csr()
+                self._cached_sparse_weights_stp = coo_stp
             else:
                 self._cached_sparse_weights_stp.values().copy_(eff_vals[self._transpose_perm])
             return self._cached_sparse_weights_stp

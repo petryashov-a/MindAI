@@ -53,14 +53,14 @@ class PredictiveMicrocircuits:
         self.td_indices, self.td_values = _build(num_connections)
         self.bu_indices, self.bu_values = _build(num_connections)
 
-        # Pre-compute CSR value permutation mappings to handle any internal PyTorch reordering during to_sparse_csr()
+        # Pre-compute value permutation mappings for coalesced COO tensor representation
         ids_td = torch.arange(self.td_values.shape[0], dtype=torch.float32, device=self.device)
         coo_td_temp = torch.sparse_coo_tensor(self.td_indices, ids_td, (num_nodes, num_nodes)).coalesce()
-        self.td_perm = coo_td_temp.to_sparse_csr().values().long()
+        self.td_perm = coo_td_temp.values().long()
 
         ids_bu = torch.arange(self.bu_values.shape[0], dtype=torch.float32, device=self.device)
         coo_bu_temp = torch.sparse_coo_tensor(self.bu_indices, ids_bu, (num_nodes, num_nodes)).coalesce()
-        self.bu_perm = coo_bu_temp.to_sparse_csr().values().long()
+        self.bu_perm = coo_bu_temp.values().long()
 
         self.prediction_neurons  = torch.zeros(num_nodes, device=self.device)
         self.error_neurons       = torch.zeros(num_nodes, device=self.device)
@@ -79,10 +79,9 @@ class PredictiveMicrocircuits:
         # ------------------------------------------------------------------
         dev = sensory_input.device
         if self._W_top is None:
-            coo = torch.sparse_coo_tensor(
+            self._W_top = torch.sparse_coo_tensor(
                 self.td_indices, self.td_values,
                 (self.num_nodes, self.num_nodes)).coalesce().to(dev)
-            self._W_top = coo.to_sparse_csr()
         else:
             self._W_top.values().copy_(self.td_values[self.td_perm].to(dev))
         W_top = self._W_top
@@ -103,10 +102,9 @@ class PredictiveMicrocircuits:
         # 3. Bottom-up drive: propagate signed error to update internal state
         # ------------------------------------------------------------------
         if self._W_bot is None:
-            coo = torch.sparse_coo_tensor(
+            self._W_bot = torch.sparse_coo_tensor(
                 self.bu_indices, self.bu_values,
                 (self.num_nodes, self.num_nodes)).coalesce().to(dev)
-            self._W_bot = coo.to_sparse_csr()
         else:
             self._W_bot.values().copy_(self.bu_values[self.bu_perm].to(dev))
         W_bot = self._W_bot
