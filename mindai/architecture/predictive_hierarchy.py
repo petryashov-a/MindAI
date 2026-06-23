@@ -45,22 +45,21 @@ class PredictiveMicrocircuits:
         # Coalesce duplicate (src, tgt) at init so values stay aligned with
         # _W_top sparse tensor (which always coalesces internally).
         def _build(n):
-            idx  = torch.randint(0, num_nodes, (2, n), device=self.device)
-            vals = torch.rand(n, device=self.device) * 0.1
-            t    = torch.sparse_coo_tensor(idx, vals, (num_nodes, num_nodes)).coalesce()
-            return t.indices(), t.values()
+            # Generate and sort indices on CPU to prevent heavy CUDA memory overhead during coalesce
+            idx_cpu = torch.randint(0, num_nodes, (2, n), device='cpu')
+            keys = idx_cpu[0] * num_nodes + idx_cpu[1]
+            sorted_keys, sort_idx = torch.sort(keys)
+            mask = torch.cat([torch.tensor([True]), sorted_keys[1:] != sorted_keys[:-1]])
+            sorted_idx = idx_cpu[:, sort_idx][:, mask]
+            vals = torch.rand(sorted_idx.shape[1], device=self.device) * 0.1
+            return sorted_idx.to(self.device), vals
 
         self.td_indices, self.td_values = _build(num_connections)
         self.bu_indices, self.bu_values = _build(num_connections)
 
-        # Pre-compute value permutation mappings for coalesced COO tensor representation
-        ids_td = torch.arange(self.td_values.shape[0], dtype=torch.float32, device=self.device)
-        coo_td_temp = torch.sparse_coo_tensor(self.td_indices, ids_td, (num_nodes, num_nodes)).coalesce()
-        self.td_perm = coo_td_temp.values().long()
-
-        ids_bu = torch.arange(self.bu_values.shape[0], dtype=torch.float32, device=self.device)
-        coo_bu_temp = torch.sparse_coo_tensor(self.bu_indices, ids_bu, (num_nodes, num_nodes)).coalesce()
-        self.bu_perm = coo_bu_temp.values().long()
+        # Pre-compute value permutation mappings (already sorted, so sequential range)
+        self.td_perm = torch.arange(self.td_values.shape[0], dtype=torch.long, device=self.device)
+        self.bu_perm = torch.arange(self.bu_values.shape[0], dtype=torch.long, device=self.device)
 
         self.prediction_neurons  = torch.zeros(num_nodes, device=self.device)
         self.error_neurons       = torch.zeros(num_nodes, device=self.device)
