@@ -221,18 +221,29 @@ class StructuralPlasticity:
         # Coalesce all per-edge state together so duplicates get merged consistently
         combined = torch.stack([self.weights_values, self.integrity_values,
                                 self._stp_u, self._stp_x, self.eligibility], dim=1)
-        temp = torch.sparse_coo_tensor(
-            self.indices, combined,
-            (self.num_nodes, self.num_nodes, 5)).coalesce()
-        self.indices          = temp.indices()
-        v                     = temp.values()
-        self.weights_values   = v[:, 0].clone()
-        self.integrity_values = torch.clamp(v[:, 1], 0.0, 2.0)
-        self._stp_u           = torch.clamp(v[:, 2], 0.0, 1.0)
-        self._stp_x           = torch.clamp(v[:, 3], 0.0, 1.0)
-        self.eligibility      = v[:, 4].clone()
-        # Free the 5-column sparse tensor before building the next one
-        del temp, combined, v
+        
+        # Flatten indices to 1D keys for unique operation
+        keys = self.indices[0] * self.num_nodes + self.indices[1]
+        unique_keys, inverse_indices = torch.unique(keys, return_inverse=True)
+        
+        # Merge duplicates by summing their properties
+        merged = torch.zeros((len(unique_keys), 5), dtype=combined.dtype, device=self.device)
+        merged.index_add_(0, inverse_indices, combined)
+        
+        # Reconstruct unique indices
+        new_src = torch.div(unique_keys, self.num_nodes, rounding_mode='floor')
+        new_tgt = unique_keys % self.num_nodes
+        self.indices = torch.stack([new_src, new_tgt])
+        
+        self.weights_values   = merged[:, 0].clone()
+        self.integrity_values = torch.clamp(merged[:, 1], 0.0, 2.0)
+        self._stp_u           = torch.clamp(merged[:, 2], 0.0, 1.0)
+        self._stp_x           = torch.clamp(merged[:, 3], 0.0, 1.0)
+        self.eligibility      = merged[:, 4].clone()
+        
+        # Free temporaries before creating sparse matrix
+        del combined, keys, unique_keys, inverse_indices, merged
+        
         coo = torch.sparse_coo_tensor(
             torch.stack([self.indices[1], self.indices[0]]), self.weights_values, (self.num_nodes, self.num_nodes)).coalesce()
         self._cached_sparse_weights = coo
